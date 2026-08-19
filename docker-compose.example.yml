@@ -18,12 +18,15 @@ services:
       dockerfile: Dockerfile.prod
     volumes:
       - ./data/database:/app/data/database
-      - ./data/content:/app/data/content
+      - /data/courses:/courses/drive1:ro
+      - /mnt/storage/courses:/courses/drive2:ro
+      - /mnt/other-drive/courses:/courses/drive3:ro
       - ./data/branding:/app/data/branding
     environment:
       - HOST=0.0.0.0
       - PORT=3000
       - NODE_ENV=production
+      - CONTENT_DIRS=drive1=/courses/drive1,drive2=/courses/drive2,drive3=/courses/drive3
 
       # First-run admin bootstrap. Required on a fresh install (no admin row
       # in the DB yet); ignored on every subsequent boot. Change BOTH before

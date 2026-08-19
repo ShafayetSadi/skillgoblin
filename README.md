@@ -27,6 +27,7 @@ SkillGoblin is a lightweight, self-contained learning platform designed for loca
   - Admin panel for user activation, role/credential management, and session control
 
 - **Content organization**
+  - Multiple named, read-only content roots merged into one course library
   - Course categories with color-coding
   - Hierarchical lesson structure
   - Video playback with progress tracking
@@ -118,7 +119,7 @@ The application reads the following environment variables:
 | `APP_DESCRIPTION` | No | `A streamlined, self-hosted learning platform` | Meta description tag and PWA manifest `description`. |
 | `APP_THEME_COLOR` | No | `#111827` | Mobile browser chrome bar color and PWA manifest `theme_color`. Hex `#RRGGBB` or `#RGB`; invalid values fall back to default and log a startup warning. NOTE: This is the browser-chrome color, not the in-app dark/light theme. |
 | `APP_BACKGROUND_COLOR` | No | `#111827` | PWA splash screen background. Same hex format as `APP_THEME_COLOR`. |
-| `CONTENT_DIR` / `CONTENT_PATH` | No | `/app/data/content` | Directory inside the container where course folders live. `CONTENT_PATH` is retained as a compatibility alias. |
+| `CONTENT_DIRS` | Yes | — | Comma-separated named absolute roots, for example `drive1=/courses/drive1,drive2=/courses/drive2`. Root names must match `[a-z][a-z0-9_-]*`. |
 | `DB_PATH` / `DATABASE_PATH` | No | `/app/data/database/database.sqlite` | Path to the SQLite database file. `DATABASE_PATH` takes precedence when both are set. |
 | `CHOKIDAR_POLLING_INTERVAL` | No | `60000` | File watcher polling interval in milliseconds. Set to `0` to disable the watcher entirely (e.g. on Unraid, to stop drives spinning up). |
 | `HOST` | No | `0.0.0.0` | Bind address. |
@@ -126,6 +127,12 @@ The application reads the following environment variables:
 | `PORT` | No | `3000` | Listen port. |
 
 `ADMIN_NAME` and `ADMIN_PASSWORD` are only consulted on a fresh install. Once any admin user exists in the database, both env vars are ignored — admins reset their own passwords from the panel.
+
+`CONTENT_DIRS` is the only supported content configuration. `CONTENT_DIR` and
+`CONTENT_PATH` are rejected. Every configured root must exist and be readable at
+startup; duplicate, nested, relative, or canonically identical roots are also
+rejected. The stable name before `=` identifies the logical root, so changing
+`drive1=/old/path` to `drive1=/new/path` preserves course identities.
 
 ### Branding / custom logos
 
@@ -169,17 +176,28 @@ docker compose up
 
 ### Adding new courses
 
-1. Create a folder under `data/content/` named after the course.
+1. Create a folder under any directory listed in `CONTENT_DIRS`.
 2. Add lesson subfolders with video files.
 3. The watcher picks them up automatically. You can also trigger a rescan from the admin avatar dropdown.
 
 ### Removing courses
 
-Delete the course folder from `data/content/`. The watcher removes the course and its progress rows.
+Delete the course folder from its content root. The watcher hides the course but
+retains its database row and progress. Recreating the same relative folder under
+the same named root restores its identity and progress.
 
 ## Upgrading from a previous version
 
 Existing installations are migrated forward automatically. The migration framework records each applied migration in a `migrations` table; on boot, any new migrations run in numeric order inside a transaction. Migrations are forward-only — there is no rollback step.
+
+The `005_content_roots` migration maps each legacy `folder_name` to exactly one
+configured root, changes course IDs to stable root-scoped UUIDs, and rewrites
+progress keys in the same transaction. Before the first upgraded start, ensure
+every course currently in the database exists in exactly one configured root.
+Missing or ambiguous legacy folders abort and roll back the migration instead
+of guessing or losing progress. If you are introducing a second root containing
+a duplicate legacy folder name, migrate with the original root first and add the
+second root after the first successful start.
 
 The 002_auth_hardening migration (run on first boot of this version) does the following on existing databases:
 
@@ -198,7 +216,8 @@ What you'll see depending on the prior state of your install:
 
 Recent versions run the app as the unprivileged `node` user (uid/gid `1000`) instead of root. If you're upgrading from a release that ran as root, your bind-mounted host data directory is likely owned by root.
 
-**No action needed on the host.** The entrypoint detects this on every start and repairs ownership of `data/database/`, `data/branding/`, and the app-managed files (`course.json`, `thumbnail.png`) under `data/content/` before dropping to `node`. Video files keep their original ownership — mode 644 read access is sufficient for streaming. Just `docker compose pull && docker compose up -d` and the upgrade goes through.
+The entrypoint repairs ownership only for the writable database and branding
+volumes. Content roots are read-only inputs and should be mounted with `:ro`.
 
 Operators who'd rather manage permissions themselves can opt out:
 - `user: "1000:1000"` in compose — entrypoint detects non-root start and skips the chown pass entirely.
@@ -211,10 +230,10 @@ The Node process (the only thing on the network) never runs as root. The brief r
 ### File structure
 
 ```
-data/
-├── database/
-│   └── database.sqlite    # SQLite database
-└── content/
+database/
+└── database.sqlite
+
+/courses/drive1/             # one configured root
     ├── Course Name/
     │   ├── thumbnail.jpg     # Course thumbnail (or thumbnail.png)
     │   ├── course.json       # Optional metadata override (title, description, etc.)
@@ -225,6 +244,10 @@ data/
     │   └── Lesson 2/
     │       └── 1. video1.mp4
     └── Another Course/
+        └── ...
+
+/courses/drive2/             # another configured root
+    └── Course Name/          # valid duplicate display/folder name
         └── ...
 ```
 
@@ -244,16 +267,16 @@ auto-detected metadata *and* values stored in the database. Schema:
 ```
 
 All fields are optional and must be strings. Unknown keys are ignored with a
-console warning. The thumbnail, lessons, and id are still derived from the
-folder structure and the `thumbnail.png` convention.
+console warning. The thumbnail and lessons are still derived from the folder
+structure. The opaque course ID is derived from the named root plus relative
+course path and is never read from `course.json`.
 
 #### Exporting from the admin panel
 
-Admins can write a `course.json` for every course at once: open the avatar
-dropdown → Admin Panel → **Content** → **Export all to course.json**. The
-existing CourseEditor modal also has a per-course **Export to course.json**
-button; it shows a yellow banner when a `course.json` is already present so
-you know your edits will be reverted on the next rescan unless you re-export.
+Content roots are never modified. Admins can download a versioned metadata
+bundle from avatar dropdown → Admin Panel → **Content**, or download a
+course-compatible `course.json` from the course editor. A `course.json` already
+present on disk remains an import override and is reapplied on every rescan.
 
 ### Subtitles
 
@@ -266,10 +289,10 @@ this PR sets up the server side so the follow-up just wires the `<track>`.
 
 ### File monitoring
 
-- Real-time monitoring of the content directory
+- Real-time monitoring of every configured content root
 - Automatic detection of new courses and course updates
-- Automatic removal of deleted courses from the database
-- Cleanup of user progress for deleted courses
+- Automatic hiding and reactivation of removed courses
+- Retention and restoration of progress for temporarily removed courses
 
 ### Benefits
 
@@ -278,7 +301,14 @@ this PR sets up the server side so the follow-up just wires the `<track>`.
 - Easy to backup, version control, or transfer courses
 - Natural organization that matches how video content is typically structured
 
-The application scans the content directory on startup to index available courses.
+The application validates and scans every content root on startup. If any root
+is unavailable, startup indexing fails without marking existing courses stale.
+Courses with the same folder name in different roots remain distinct.
+
+Root paths may themselves be symlinks after canonical validation. Top-level
+course symlinks are ignored. Nested symlinks are usable only when their target
+remains inside the same course; cross-course and cross-root targets are rejected.
+Configured roots may not overlap.
 
 ### Newest-first sort
 
@@ -310,7 +340,7 @@ skillgoblin/
 │       └── e2e/               # Playwright
 └── data/                      # Persistent data
     ├── database/              # database.sqlite
-    └── content/               # Course videos and assets
+    └── content/               # Example host content mounted read-only as a named root
 ```
 
 ## Running tests
@@ -332,10 +362,11 @@ The bootstrap plugin found no admin row and the env vars aren't set. Add `ADMIN_
 
 ### Course content not appearing
 
-1. Check that the course folder exists in `data/content/`
-2. Check the application logs for any error messages
-3. Ensure video files are in supported formats (MP4 recommended)
-4. Try a manual rescan from the admin avatar dropdown
+1. Check that the course folder exists in one of the configured `CONTENT_DIRS`
+2. Check that every configured root is mounted and readable
+3. Check the application logs for any error messages
+4. Ensure video files are in supported formats (MP4 recommended)
+5. Try a manual rescan from the admin avatar dropdown
 
 ### Locked out of admin
 

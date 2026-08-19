@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 // PR-B e2e: validates the new dropzone UI in CourseEditor. The dockerized
-// test stack mounts `frontend/tests/fixtures/content` at `/app/data/content`
+// test stack mounts the fixture as two read-only named content roots
 // (see docker-compose.test.yml). A `beforeAll` triggers a rescan so the
 // fixture course is in the DB before the editor is opened. Tests fail
 // loudly if the fixture is missing — no skip fallback.

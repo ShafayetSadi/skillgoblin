@@ -4,9 +4,7 @@
 #  1. (root pass) Repair host bind-mount ownership and drop privileges.
 #     Runs only when the container started as root, which is the default
 #     for our image. Bounded to /app/data/database and /app/data/branding
-#     because they need write access; /app/data/content is intentionally
-#     left alone since read access is sufficient and recursive chown of a
-#     potentially huge content folder on every start would be pathological.
+#     because they need write access. Content roots are read-only inputs.
 #     After fixup, su-exec re-runs this same script as the `node` user
 #     (uid 1000), which falls through to the second pass below.
 #
@@ -38,7 +36,7 @@ set -e
 if [ "$(id -u)" = "0" ]; then
   # SKILLGOBLIN_SKIP_PERM_REPAIR=1 disables the chown pass below while
   # still dropping to the node user. Used by docker-compose.test.yml,
-  # where /app/data/branding and /app/data/content are bind-mounted from
+  # where branding and content are bind-mounted from
   # tracked repo fixtures and a recursive chown would dirty the working
   # tree on the host.
   if [ "${SKILLGOBLIN_SKIP_PERM_REPAIR:-}" != "1" ]; then
@@ -54,26 +52,6 @@ if [ "$(id -u)" = "0" ]; then
         fi
       fi
     done
-    # data/content can be huge (typical course library = dozens of GB of
-    # video). Recursive chown on every restart would be pathological. Two
-    # targeted passes instead:
-    #   1. chown directory entries so the node user can CREATE new files
-    #      inside them (admin "Export course" and "Upload thumbnail" both
-    #      drop fresh files into per-course directories).
-    #   2. chown the specific filenames the app itself writes
-    #      (course.json and thumbnail.png) -- overwriting an existing
-    #      file with writeFileSync needs write perm on the FILE, not
-    #      just its parent. Operator-supplied cover.jpg / poster.jpg /
-    #      video files etc. stay under their original ownership; the
-    #      app only ever reads those.
-    if [ -d /app/data/content ]; then
-      if ! find /app/data/content -type d -exec chown node:node {} + 2>/dev/null; then
-        echo "[skillgoblin] warn: chown of content directory tree failed; continuing as-is" >&2
-      fi
-      if ! find /app/data/content -type f \( -name 'course.json' -o -name 'thumbnail.png' \) -exec chown node:node {} + 2>/dev/null; then
-        echo "[skillgoblin] warn: chown of app-managed files in content failed; continuing as-is" >&2
-      fi
-    fi
   fi
   # Drop privileges and re-enter this script as `node`. exec-replace so the
   # node process is still PID 1 from Docker's perspective (signal handling,

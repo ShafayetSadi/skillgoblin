@@ -235,11 +235,8 @@
       <div v-if="activeTab === 'content'" class="space-y-4" data-testid="admin-tab-content-pane">
         <h3 class="text-white font-semibold">Course metadata</h3>
         <p class="text-sm text-gray-400">
-          Export the current database metadata for every course into a
-          <code class="bg-gray-700 px-1 rounded">course.json</code> file inside its
-          folder. Existing files are overwritten. The exported JSON does not include
-          the thumbnail — drop a <code class="bg-gray-700 px-1 rounded">thumbnail.png</code>
-          next to it for portability.
+          Download a root-agnostic JSON bundle containing the current database
+          metadata for every available course. Content mounts are never modified.
         </p>
         <button
           type="button"
@@ -248,17 +245,11 @@
           :disabled="exportingAll"
           @click="exportAllJson"
         >
-          {{ exportingAll ? 'Exporting…' : 'Export all to course.json' }}
+          {{ exportingAll ? 'Exporting…' : 'Download metadata bundle' }}
         </button>
         <div v-if="exportError" class="text-red-400 text-sm" data-testid="admin-export-error">{{ exportError }}</div>
         <div v-if="exportResult" class="text-sm" data-testid="admin-export-result">
-          <p class="text-green-400">Wrote {{ exportResult.written.length }} file(s).</p>
-          <p v-if="exportResult.failed.length" class="text-orange-400">
-            {{ exportResult.failed.length }} failed.
-          </p>
-          <ul v-if="exportResult.failed.length" class="list-disc ml-6 text-orange-300">
-            <li v-for="f in exportResult.failed" :key="f.id">{{ f.id }}: {{ f.reason }}</li>
-          </ul>
+          <p class="text-green-400">Downloaded {{ exportResult }} course(s).</p>
         </div>
       </div>
     </div>
@@ -822,7 +813,14 @@ async function exportAllJson() {
   exportError.value = '';
   try {
     const res = await $fetch('/api/courses/export-json-all', { method: 'POST' });
-    exportResult.value = res;
+    const blob = new Blob([JSON.stringify(res, null, 2) + '\n'], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'skillgoblin-course-metadata.json';
+    link.click();
+    URL.revokeObjectURL(url);
+    exportResult.value = res.courses?.length || 0;
   } catch (err) {
     exportError.value = err?.statusMessage || err?.message || 'Export failed';
   } finally {

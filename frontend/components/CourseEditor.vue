@@ -1,27 +1,7 @@
 <template>
   <div class="course-editor">
     <form @submit.prevent="handleSubmit" class="space-y-6">
-      <!-- Course ID (Read-only if editing) -->
-      <div class="grid grid-cols-1 gap-6 sm:grid-cols-2">
-        <div>
-          <label for="courseId" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
-            Course ID
-          </label>
-          <input 
-            type="text" 
-            id="courseId" 
-            v-model="formData.id"
-            :readonly="isEditing"
-            :class="{'bg-gray-100 dark:bg-gray-700': isEditing}"
-            class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-xs focus:border-primary-500 focus:ring-primary-500 dark:bg-gray-800 dark:text-white sm:text-sm px-3 py-2"
-            placeholder="e.g. my-course-name"
-            required
-          />
-          <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
-            Used for URL and file paths, no spaces or special characters except hyphens.
-          </p>
-        </div>
-
+      <div>
         <div>
           <label for="courseCategory" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
             Category
@@ -200,9 +180,8 @@
         class="rounded border border-yellow-600 bg-yellow-900/20 text-yellow-200 text-sm px-3 py-2"
       >
         <strong>course.json detected.</strong>
-        This course has a JSON override on disk. Saving here updates only the
-        database; click <em>Export to course.json</em> to also write the JSON,
-        otherwise the next rescan will revert your edits.
+            This course has a read-only JSON override on disk. Saving here updates
+            the database, but the next rescan will reapply fields from that file.
       </div>
 
       <!-- Submit buttons -->
@@ -308,10 +287,16 @@ async function exportThisCourseJson() {
       exportError.value = saveRes?.message || 'Save before export failed.';
       return;
     }
-    await $fetch(`/api/courses/${encodeURIComponent(formData.value.id)}/export-json`, {
+    const exported = await $fetch(`/api/courses/${encodeURIComponent(formData.value.id)}/export-json`, {
       method: 'POST',
     });
-    hasJson.value = true;
+    const blob = new Blob([JSON.stringify(exported, null, 2) + '\n'], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'course.json';
+    link.click();
+    URL.revokeObjectURL(url);
   } catch (err) {
     console.error('Export failed:', err);
     exportError.value = err?.data?.statusMessage || err?.statusMessage || err?.message || 'Export failed.';

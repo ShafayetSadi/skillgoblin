@@ -1,8 +1,6 @@
-import fs from 'fs';
 import { defineEventHandler, readBody, getMethod, createError } from 'h3';
 import { getDb } from '../../utils/db';
 import { requireSelfOrAdmin } from '../../utils/authz';
-import { getContentDir, generateCourseId } from '../../utils/courseHelpers';
 
 // /api/user-progress/[userId]
 //   GET  — read the user's progress JSON blob
@@ -27,23 +25,7 @@ export default defineEventHandler(async (event) => {
 
       const progress = JSON.parse(result.progress);
 
-      // Drop progress entries for courses that no longer exist on disk.
-      const contentDir = getContentDir();
-      let courseDirs = [];
-      try {
-        courseDirs = fs.readdirSync(contentDir, { withFileTypes: true })
-          .filter(d => d.isDirectory())
-          .map(d => generateCourseId(d.name));
-      } catch (err) {
-        // If the content dir doesn't exist yet, just return everything.
-        return { progress };
-      }
-
-      const cleaned = {};
-      for (const courseId of Object.keys(progress)) {
-        if (courseDirs.includes(courseId)) cleaned[courseId] = progress[courseId];
-      }
-      return { progress: cleaned };
+      return { progress };
     } catch (error) {
       console.error('Error fetching user progress:', error);
       throw createError({ statusCode: 500, statusMessage: 'Failed to fetch user progress' });
@@ -56,6 +38,11 @@ export default defineEventHandler(async (event) => {
       if (!body?.courseId || !body.data) {
         throw createError({ statusCode: 400, statusMessage: 'Course ID and progress data are required' });
       }
+      const course = db.prepare(`
+        SELECT 1 FROM courses c JOIN content_roots r ON r.id=c.content_root_id
+        WHERE c.id=? AND c.is_available=1 AND r.is_configured=1 AND r.is_available=1
+      `).get(body.courseId);
+      if (!course) throw createError({ statusCode: 404, statusMessage: 'Course not found' });
 
       const existing = db.prepare('SELECT progress FROM user_progress WHERE user_id = ?').get(userId);
       const progress = existing ? JSON.parse(existing.progress) : {};

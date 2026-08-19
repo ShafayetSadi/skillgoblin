@@ -7,16 +7,20 @@ let db;
 beforeEach(() => {
   db = new Database(':memory:');
   db.exec(`
+    CREATE TABLE content_roots (id TEXT PRIMARY KEY, configured_path TEXT, canonical_path TEXT, position INTEGER, is_configured INTEGER, is_available INTEGER);
+    INSERT INTO content_roots VALUES ('main','/main','/main',0,1,1);
     CREATE TABLE courses (
       id TEXT PRIMARY KEY,
+      content_root_id TEXT NOT NULL,
+      relative_path TEXT NOT NULL,
       title TEXT NOT NULL,
       description TEXT,
       thumbnail TEXT,
       thumbnail_data BLOB,
-      folder_name TEXT,
       category TEXT DEFAULT 'Uncategorized',
       release_date TEXT,
       data TEXT,
+      is_available INTEGER DEFAULT 1,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -25,11 +29,11 @@ beforeEach(() => {
   // regression where "newest" silently falls back to "title" would fail.
   // Apple < Zebra alphabetically; Zebra is younger.
   db.prepare(
-    `INSERT INTO courses (id, title, data, created_at) VALUES (?, ?, ?, ?)`,
-  ).run('apple', 'Apple', JSON.stringify({ id: 'apple', title: 'Apple' }), '2020-01-01 00:00:00');
+    `INSERT INTO courses (id, content_root_id, relative_path, title, data, created_at) VALUES (?, 'main', ?, ?, ?, ?)`,
+  ).run('apple', 'Apple', 'Apple', JSON.stringify({ id: 'apple', title: 'Apple' }), '2020-01-01 00:00:00');
   db.prepare(
-    `INSERT INTO courses (id, title, data, created_at) VALUES (?, ?, ?, ?)`,
-  ).run('zebra', 'Zebra', JSON.stringify({ id: 'zebra', title: 'Zebra' }), '2026-05-03 00:00:00');
+    `INSERT INTO courses (id, content_root_id, relative_path, title, data, created_at) VALUES (?, 'main', ?, ?, ?, ?)`,
+  ).run('zebra', 'Zebra', 'Zebra', JSON.stringify({ id: 'zebra', title: 'Zebra' }), '2026-05-03 00:00:00');
 });
 afterEach(() => {
   if (db) db.close();

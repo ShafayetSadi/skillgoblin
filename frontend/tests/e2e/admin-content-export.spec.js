@@ -2,10 +2,8 @@ import { test, expect } from '@playwright/test';
 
 // PR-A e2e: validates the admin Content-tab export flow and the related
 // authorization on the new endpoints. The dockerized test fixture has an
-// empty /app/data/content tmpfs, so the bulk export legitimately returns
-// `{ written: [], failed: [] }`. We test the auth boundary, the response
-// shape, and the UI surface — not the filesystem write itself, which is
-// covered by the unit tests on the underlying utilities.
+// The test stack mounts two read-only named roots. Export returns a downloadable
+// root-agnostic JSON bundle and never writes into either content root.
 
 const ADMIN_NAME = process.env.PW_ADMIN_NAME || 'root';
 const ADMIN_PASSWORD = process.env.PW_ADMIN_PASSWORD || 'TestAdminPass!';
@@ -38,13 +36,8 @@ test.describe('admin content export — auth and shape', () => {
     const r = await request.post('/api/courses/export-json-all');
     expect(r.ok()).toBeTruthy();
     const body = await r.json();
-    expect(body).toHaveProperty('success');
-    expect(body).toHaveProperty('written');
-    expect(body).toHaveProperty('failed');
-    expect(Array.isArray(body.written)).toBe(true);
-    expect(Array.isArray(body.failed)).toBe(true);
-    // Empty fixture content dir — both arrays are []. Don't assert specific
-    // sizes (a future fixture with seed courses should still pass).
+    expect(body.version).toBe(1);
+    expect(Array.isArray(body.courses)).toBe(true);
   });
 
   test('GET /api/courses/:id/has-json on a non-existent course returns 404', async ({ request }) => {
@@ -59,7 +52,7 @@ test.describe('admin content export — auth and shape', () => {
     expect(r.status()).toBe(404);
   });
 
-  test('export-all writes course.json into the fixture course folder', async ({ request }) => {
+  test('export-all returns metadata for courses across the read-only roots', async ({ request }) => {
     await loginAdmin(request);
     // Trigger a rescan first so the fixture course is in the DB.
     const rescan = await request.post('/api/courses/rescan', { data: { preserveMetadata: true } });
@@ -75,9 +68,8 @@ test.describe('admin content export — auth and shape', () => {
     const r = await request.post('/api/courses/export-json-all');
     expect(r.ok()).toBeTruthy();
     const body = await r.json();
-    // The fixture has at least one course; export-all should report it.
-    expect(body.written.length).toBeGreaterThanOrEqual(1);
-    expect(body.failed).toEqual([]);
+    expect(body.courses.length).toBeGreaterThanOrEqual(2);
+    expect(body.courses.every(course => !('root' in course) && !('path' in course))).toBe(true);
   });
 });
 

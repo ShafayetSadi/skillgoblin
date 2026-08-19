@@ -28,6 +28,12 @@ SkillGoblin is designed for **trusted local networks** (a homelab, a small class
 - Persistent XSS in user-controllable content
 - Path traversal and other input-validation bugs
 
+Course files are resolved from the database through their owning named content
+root. SkillGoblin rejects overlapping canonical roots, lexical traversal,
+cross-root access, and symlinks whose targets escape the owning course. Root
+paths themselves may be symlinks only when their canonical targets pass the
+same startup validation.
+
 Out of scope (or addressed by deployment, not the app):
 
 - TLS termination — runs as a plain HTTP service. Operators put it behind nginx / Caddy / Traefik for HTTPS.

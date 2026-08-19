@@ -17,8 +17,9 @@ export function fetchCoursesByIds(db, courseIds) {
   if (!courseIds.length) return [];
   const placeholders = courseIds.map(() => '?').join(',');
   const rows = db.prepare(`
-    SELECT id, data FROM courses
-    WHERE id IN (${placeholders})
+    SELECT c.id, c.data FROM courses c JOIN content_roots r ON r.id=c.content_root_id
+    WHERE c.id IN (${placeholders}) AND c.is_available=1
+      AND r.is_configured=1 AND r.is_available=1
   `).all(courseIds);
 
   return rows.map(row => {

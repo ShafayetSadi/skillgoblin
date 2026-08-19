@@ -80,7 +80,7 @@
         <div class="p-6">
           <div class="flex justify-between items-center mb-6">
             <h2 class="text-xl font-bold text-gray-900 dark:text-white">
-              {{ currentCourse?.id ? 'Edit Course' : 'Create Course' }}
+              Edit Course
             </h2>
             <button
               @click="closeCourseEditor"

@@ -12,7 +12,7 @@
 #   docker compose -f docker-compose.manual.yml down
 #   rm -rf manual-test/data/database/*
 #
-# Drop course folders into manual-test/data/content/ — the watcher picks
+# Drop course folders into manual-test/data/content-a/ or content-b/ — the watcher picks
 # them up live (or rescan from the admin panel).
 ---
 services:
@@ -23,13 +23,15 @@ services:
     container_name: skillgoblin-manual
     volumes:
       - ./manual-test/data/database:/app/data/database
-      - ./manual-test/data/content:/app/data/content
+      - ./manual-test/data/content-a:/courses/manual-a:ro
+      - ./manual-test/data/content-b:/courses/manual-b:ro
       - ./manual-test/data/branding:/app/data/branding
     environment:
       - HOST=0.0.0.0
       - PORT=3000
       - NODE_ENV=production
       - DATABASE_PATH=/app/data/database/database.sqlite
+      - CONTENT_DIRS=manual-a=/courses/manual-a,manual-b=/courses/manual-b
       - ADMIN_NAME=admin
       - ADMIN_PASSWORD=skill-goblin-test
       - CHOKIDAR_POLLING_INTERVAL=60000

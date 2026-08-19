@@ -1,92 +1,76 @@
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
 import { createError } from 'h3';
+import { pathIsWithin } from './contentRoots.js';
 
-// Content directory path
-export const getContentDir = () => path.resolve(
-  process.env.CONTENT_DIR || process.env.CONTENT_PATH || '/app/data/content'
-);
-
-// Video extensions surfaced as lessons. Each entry has been empirically
-// verified to play in mainstream desktop browsers (Chrome/Edge) when served
-// with a `video/mp4` content-type — see /api/content/[...path].js. The
-// inner streams need to be browser-decodable (H.264 + AAC is the safe
-// baseline); exotic codecs in any container will still fail playback.
 export const VIDEO_EXTENSIONS = new Set(['.mp4', '.mkv', '.avi']);
 
-// Resolve a course folder name relative to the content directory and verify
-// the result stays inside the content root. Throws on traversal attempts,
-// empty/null input, or absolute paths. Used by every endpoint that turns a
-// DB-stored folder_name into a real fs path.
-export function resolveCourseDir(folderName) {
-  if (!folderName || typeof folderName !== 'string' || folderName.length === 0) {
-    throw createError({ statusCode: 400, statusMessage: 'Invalid course folder' });
-  }
-  // A course folder name is a single directory name. Reject anything that
-  // looks like a path (separators) or starts with a dot (hidden dirs and
-  // traversal anchors). Windows uses both '/' and '\\'.
-  if (
-    folderName === '.' ||
-    folderName === '..' ||
-    folderName.startsWith('.') ||
-    folderName.includes('/') ||
-    folderName.includes('\\') ||
-    folderName.includes('\0')
-  ) {
-    throw createError({ statusCode: 400, statusMessage: 'Invalid course folder' });
-  }
-  const root = path.resolve(getContentDir());
-  const candidate = path.resolve(root, folderName);
-  const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
-  if (!candidate.startsWith(rootWithSep) || candidate === root) {
-    throw createError({ statusCode: 400, statusMessage: 'Invalid course folder' });
-  }
-  return candidate;
+function courseError(statusCode, statusMessage) {
+  throw createError({ statusCode, statusMessage });
 }
 
-// Resolve a path inside a specific course's directory, rejecting any
-// segment that escapes the course root. Used by the content endpoint
-// after the course folder is identified, so URL path traversal in later
-// segments cannot reach files outside the course directory.
-export function resolvePathInCourse(courseDir, ...segments) {
-  const root = path.resolve(courseDir);
+export function resolveCourseById(db, courseId, { requireAvailable = true, notFoundMessage = 'Course not found' } = {}) {
+  const row = db.prepare(`
+    SELECT c.id, c.content_root_id, c.relative_path, c.title,
+           c.is_available AS course_available, r.configured_path, r.canonical_path,
+           r.is_configured, r.is_available AS root_available
+    FROM courses c JOIN content_roots r ON r.id=c.content_root_id WHERE c.id=?
+  `).get(courseId);
+  if (!row) courseError(404, notFoundMessage);
+  if (!row.is_configured || !row.root_available) courseError(503, 'Content root unavailable');
+  if (requireAvailable && !row.course_available) courseError(404, notFoundMessage);
+
+  try {
+    const liveRoot = fs.realpathSync.native(row.configured_path);
+    fs.accessSync(liveRoot, fs.constants.R_OK | fs.constants.X_OK);
+    if (liveRoot !== row.canonical_path) courseError(503, 'Content root changed; rescan required');
+  } catch (error) {
+    if (error?.statusCode) throw error;
+    courseError(503, 'Content root unavailable');
+  }
+
+  const courseDir = path.resolve(row.canonical_path, row.relative_path);
+  if (!pathIsWithin(row.canonical_path, courseDir) || courseDir === path.resolve(row.canonical_path)) {
+    courseError(500, 'Invalid stored course path');
+  }
+  let canonicalCourseDir;
+  try { canonicalCourseDir = fs.realpathSync.native(courseDir); }
+  catch (error) {
+    if (error.code === 'ENOENT') courseError(404, notFoundMessage);
+    throw error;
+  }
+  if (!pathIsWithin(row.canonical_path, canonicalCourseDir)) courseError(500, 'Invalid stored course path');
+  return { ...row, courseDir, canonicalCourseDir };
+}
+
+export function resolvePathInCourse(course, ...segments) {
+  const root = path.resolve(course.courseDir || course);
+  const canonicalRoot = course.canonicalCourseDir || fs.realpathSync.native(root);
+  for (const segment of segments) {
+    if (typeof segment !== 'string' || segment.includes('\0') || segment.includes('\\') || path.isAbsolute(segment)) courseError(400, 'Invalid path');
+  }
   const candidate = path.resolve(root, ...segments);
-  const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
-  if (candidate !== root && !candidate.startsWith(rootWithSep)) {
-    throw createError({ statusCode: 400, statusMessage: 'Invalid path' });
-  }
-  return candidate;
+  if (!pathIsWithin(root, candidate) || candidate === root) courseError(400, 'Invalid path');
+  return { candidate, canonicalRoot };
 }
 
-// Function to generate a course ID from a title
-export const generateCourseId = (title) => {
-  return title
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, '') // Remove special characters
-    .replace(/\s+/g, '-') // Replace spaces with hyphens
-    .replace(/-+/g, '-'); // Replace multiple hyphens with a single one
-};
+export function resolveExistingPathInCourse(course, ...segments) {
+  const { candidate, canonicalRoot } = resolvePathInCourse(course, ...segments);
+  let canonicalCandidate;
+  try { canonicalCandidate = fs.realpathSync.native(candidate); }
+  catch (error) {
+    if (error.code === 'ENOENT') courseError(404, 'File not found');
+    throw error;
+  }
+  if (!pathIsWithin(canonicalRoot, canonicalCandidate) || canonicalCandidate === canonicalRoot) courseError(400, 'Invalid path');
+  return canonicalCandidate;
+}
 
- // Natural sort function for video/lesson sorting
 export const naturalSort = (a, b, property = 'title') => {
   const aValue = a[property];
   const bValue = b[property];
-  
   const aMatch = aValue.match(/^(\d+)/);
   const bMatch = bValue.match(/^(\d+)/);
-  
-  if (aMatch && bMatch) {
-    return parseInt(aMatch[1]) - parseInt(bMatch[1]);
-  }
+  if (aMatch && bMatch) return parseInt(aMatch[1]) - parseInt(bMatch[1]);
   return aValue.localeCompare(bValue);
 };
-
-// Look up a course's folder_name by ID and resolve it to a directory on
-// disk. Throws a 404 when the course (or its folder_name) is missing and
-// propagates resolveCourseDir's 400 on invalid folder names.
-export function resolveCourseById(db, courseId, { notFoundMessage = 'Course not found' } = {}) {
-  const row = db.prepare('SELECT folder_name FROM courses WHERE id = ?').get(courseId);
-  if (!row || !row.folder_name) {
-    throw createError({ statusCode: 404, statusMessage: notFoundMessage });
-  }
-  return { folderName: row.folder_name, courseDir: resolveCourseDir(row.folder_name) };
-}

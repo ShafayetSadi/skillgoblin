@@ -1,48 +1,18 @@
-import fs from 'fs';
-import path from 'path';
-import { defineEventHandler } from 'h3';
-import { getDb } from '../../utils/db';
-import { resolveCourseDir } from '../../utils/courseHelpers';
+import { defineEventHandler, setResponseHeader } from 'h3';
+import { getDb } from '../../utils/db.js';
 import { buildCourseJsonPayload } from '../../utils/courseJsonOverride.js';
-import { requireAdmin } from '../../utils/authz';
+import { requireAdmin } from '../../utils/authz.js';
 
 export default defineEventHandler((event) => {
   requireAdmin(event);
-  const db = getDb();
-  const rows = db
-    .prepare('SELECT id, title, description, category, release_date, folder_name FROM courses')
-    .all();
-
-  const written = [];
-  const failed = [];
-
-  for (const row of rows) {
-    if (!row.folder_name) {
-      failed.push({ id: row.id, reason: 'no folder_name in DB' });
-      continue;
-    }
-    let dir;
-    try {
-      dir = resolveCourseDir(row.folder_name);
-    } catch {
-      failed.push({ id: row.id, reason: 'invalid folder_name in DB' });
-      continue;
-    }
-    if (!fs.existsSync(dir)) {
-      failed.push({ id: row.id, reason: 'folder missing on disk' });
-      continue;
-    }
-
-    const payload = buildCourseJsonPayload(row);
-
-    try {
-      fs.writeFileSync(path.join(dir, 'course.json'), JSON.stringify(payload, null, 2) + '\n', 'utf8');
-      written.push(row.id);
-    } catch (err) {
-      console.error(`[export-json-all] write failed for ${row.id}:`, err);
-      failed.push({ id: row.id, reason: 'write failed' });
-    }
-  }
-
-  return { success: failed.length === 0, written, failed };
+  const rows = getDb().prepare(`
+    SELECT c.id, c.title, c.description, c.category, c.release_date
+    FROM courses c JOIN content_roots r ON r.id=c.content_root_id
+    WHERE c.is_available=1 AND r.is_configured=1 AND r.is_available=1
+    ORDER BY c.title, c.id
+  `).all();
+  const payload = { version: 1, courses: rows.map(row => ({ id: row.id, metadata: buildCourseJsonPayload(row) })) };
+  setResponseHeader(event, 'Content-Type', 'application/json; charset=utf-8');
+  setResponseHeader(event, 'Content-Disposition', 'attachment; filename="skillgoblin-course-metadata.json"');
+  return JSON.stringify(payload, null, 2) + '\n';
 });

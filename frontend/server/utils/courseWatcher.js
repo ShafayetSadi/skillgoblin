@@ -1,449 +1,177 @@
-import fs from 'fs';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
 import chokidar from 'chokidar';
-import { getContentDir, generateCourseId } from './courseHelpers';
-import { generateCourseJson } from './courseGenerator';
-import { saveCourseToDb, removeCourseFromDb, getCoursesWithDirectories } from './courseDatabase';
-import { getDb } from './db';
-import {
-  readAndProcessThumbnail,
-  getCourseRootPath,
-  findLocalThumbnailPath,
-  extractFrameThumbnail,
-} from './thumbnailUtils';
+import { parseContentRoots, synchronizeContentRoots, findOwningRoot } from './contentRoots.js';
+import { deriveCourseId } from './courseIdentity.js';
+import { generateCourseJson } from './courseGenerator.js';
+import { saveCourseToDb, markCourseUnavailable, getCoursesWithDirectories } from './courseDatabase.js';
+import { getDb } from './db.js';
+import { readAndProcessThumbnail, findLocalThumbnailPath, extractFrameThumbnail } from './thumbnailUtils.js';
 import { readCourseJson, ALLOWED } from './courseJsonOverride.js';
 
-// Read just the keys of course.json so we know which fields the operator
-// pinned. Returns an empty Set on any read/parse failure so the caller treats
-// the course as "no pinned fields."
-function readCourseJsonKeys(courseDirPath) {
-  const parsed = readCourseJson(courseDirPath);
-  if (!parsed) return new Set();
-  const pinned = new Set();
-  for (const key of ALLOWED) {
-    if (key in parsed && typeof parsed[key] === 'string') {
-      pinned.add(key);
-    }
-  }
-  return pinned;
-}
-
-// Status tracking for initial scan
 export const initialScanStatus = {
-  inProgress: false,
-  complete: false,
-  totalCourses: 0,
-  processedCourses: 0,
-  startTime: null,
-  endTime: null,
-  error: null,
-  preserveMetadata: true
+  inProgress: false, complete: false, totalCourses: 0, processedCourses: 0,
+  totalRoots: 0, processedRoots: 0, startTime: null, endTime: null,
+  error: null, preserveMetadata: true
 };
 
 export function topLevelCoursePath(contentDir, changedPath) {
   const root = path.resolve(contentDir);
-  const candidate = path.resolve(changedPath);
-  const relative = path.relative(root, candidate);
+  const relative = path.relative(root, path.resolve(changedPath));
   if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null;
-  const firstSegment = relative.split(path.sep)[0];
-  return firstSegment ? path.join(root, firstSegment) : null;
+  const first = relative.split(path.sep)[0];
+  return first ? path.join(root, first) : null;
 }
 
-// Resolve the absolute path of a course's first video by walking the lesson
-// tree the generator produced. Used by the frame-extract thumbnail fallback
-// when neither a local asset nor a cached DB blob is available.
-function resolveFirstVideoPath(courseRoot, courseData) {
-  if (!courseRoot || !courseData?.lessons?.length) return null;
-  for (const lesson of courseData.lessons) {
-    const videos = lesson?.videos;
-    if (!Array.isArray(videos) || videos.length === 0) continue;
-    const file = videos[0]?.file;
-    if (!file || typeof file !== 'string') continue;
-    return path.join(courseRoot, lesson.folder || '', file);
+function jsonPinnedFields(coursePath) {
+  const parsed = readCourseJson(coursePath);
+  if (!parsed) return new Set();
+  return new Set(ALLOWED.filter(key => key in parsed && typeof parsed[key] === 'string'));
+}
+
+function firstVideoPath(coursePath, courseData) {
+  for (const lesson of courseData.lessons || []) {
+    const video = lesson.videos?.[0];
+    if (video?.file) return path.join(coursePath, lesson.folder || '', video.file);
   }
   return null;
 }
 
-// Function to synchronize thumbnail between filesystem and database.
-// `courseData` is optional — passing it lets the function fall back to a
-// frame-extract from the first video when no operator-supplied cover art
-// exists. Callers that don't have courseData (e.g. a generic refresh path)
-// just lose the frame-extract fallback, which degrades to "no thumbnail."
-async function synchronizeCourseThumbnail(courseId, courseFolderName, courseData = null) {
-  if (!courseId || !courseFolderName) {
-    console.error('synchronizeCourseThumbnail: courseId and courseFolderName are required.');
-    return;
-  }
-
+async function synchronizeCourseThumbnail(courseId, coursePath, courseData) {
   const db = getDb();
-  const courseRoot = getCourseRootPath(courseFolderName);
-
-  // Plex-style asset detection: thumbnail.* / cover.* / poster.* / folder.*
-  // in priority order. Returning null means none exist on disk.
-  const localThumbnailPath = findLocalThumbnailPath(courseRoot);
-
-  try {
-    const courseResult = db.prepare('SELECT thumbnail_data FROM courses WHERE id = ?').get(courseId);
-    const dbThumbnailData = courseResult ? courseResult.thumbnail_data : null;
-
-    // Read the local thumbnail by attempt rather than by existsSync-then-act.
-    // ENOENT means it doesn't exist (a normal state, not an error); any other
-    // failure propagates to the outer catch. This buffer-or-null pattern
-    // eliminates the TOCTOU window between an upfront fs.existsSync sample
-    // and the later read/write that CodeQL flagged twice (#30, #134).
-    let localFileBuffer = null;
-    if (localThumbnailPath) {
-      try {
-        localFileBuffer = fs.readFileSync(localThumbnailPath);
-      } catch (readError) {
-        if (readError.code !== 'ENOENT') throw readError;
-      }
+  const localPath = findLocalThumbnailPath(coursePath);
+  const row = db.prepare('SELECT thumbnail_data FROM courses WHERE id=?').get(courseId);
+  let localBuffer = null;
+  if (localPath) {
+    try { localBuffer = fs.readFileSync(localPath); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  if (localBuffer) {
+    const processed = await readAndProcessThumbnail(localPath, localBuffer);
+    const operatorAuthored = path.basename(localPath) !== 'thumbnail.png';
+    if (processed && (!row?.thumbnail_data || (operatorAuthored && !processed.equals(row.thumbnail_data)))) {
+      db.prepare('UPDATE courses SET thumbnail_data=? WHERE id=?').run(processed, courseId);
     }
-
-    // Case 1: DB thumbnail_data is NULL and a local asset exists.
-    if (!dbThumbnailData && localFileBuffer) {
-      const processedLocalBuffer = await readAndProcessThumbnail(localThumbnailPath, localFileBuffer);
-      if (processedLocalBuffer) {
-        db.prepare('UPDATE courses SET thumbnail_data = ? WHERE id = ?').run(processedLocalBuffer, courseId);
-      }
-    }
-    // Case 2: DB thumbnail_data is NULL and no local asset.
-    // Try to derive one from the first video at the 10% mark. Frame-extract
-    // failures (missing ffmpeg, corrupt video, ...) silently degrade to "no
-    // thumbnail" — the UI's letter-fallback handles that branch already.
-    else if (!dbThumbnailData && !localFileBuffer) {
-      const firstVideoPath = resolveFirstVideoPath(courseRoot, courseData);
-      if (firstVideoPath) {
-        const frameBuffer = await extractFrameThumbnail(firstVideoPath);
-        if (frameBuffer) {
-          db.prepare('UPDATE courses SET thumbnail_data = ? WHERE id = ?').run(frameBuffer, courseId);
-        }
-      }
-    }
-    // Case 3: DB thumbnail_data is NOT NULL and no local asset.
-    // Write the DB blob back to thumbnail.png so the operator sees a file in
-    // the course folder. Uses the canonical name (thumbnail.png) so a
-    // round-trip never overwrites a user-supplied cover.jpg / poster.png.
-    else if (dbThumbnailData && !localFileBuffer) {
-      const writeBackPath = path.join(courseRoot, 'thumbnail.png');
-      try {
-        // mkdirSync with recursive:true is idempotent — no exists-check needed.
-        fs.mkdirSync(courseRoot, { recursive: true });
-        // 'wx' flag: atomic create-only-if-not-exists. EEXIST means a
-        // concurrent process created the file between our read attempt
-        // above and this write — their file is already a thumbnail, so
-        // leave it.
-        fs.writeFileSync(writeBackPath, dbThumbnailData, { flag: 'wx' });
-      } catch (writeError) {
-        if (writeError.code !== 'EEXIST') {
-          console.error(`[${courseId}] Error writing DB thumbnail to ${writeBackPath}:`, writeError);
-        }
-      }
-    }
-    // Case 4: DB thumbnail_data is NOT NULL and a local asset exists.
-    // If the operator dropped one of the named cover-art conventions
-    // (cover.jpg / poster.png / folder.jpg / ...), prefer it over whatever
-    // is in the DB — that's the "I imported the course, then added a cover
-    // later, rescanned, and expected it to win" flow. We only ever write
-    // back to thumbnail.png ourselves, so a thumbnail.png on disk is the
-    // round-tripped DB blob and stays under the existing edit-process-wins
-    // semantics (admin uploads via the UI keep their precedence there).
-    else if (dbThumbnailData && localFileBuffer) {
-      const localName = path.basename(localThumbnailPath);
-      // Case-sensitive comparison: the only filename we ever round-trip from
-      // DB to disk is exactly `thumbnail.png`. Any other casing or basename
-      // (`Thumbnail.png`, `cover.jpg`, `Poster.PNG`, ...) means an operator
-      // dropped the file in by hand.
-      const isOperatorAuthored = localName !== 'thumbnail.png';
-      const differs = !localFileBuffer.equals(dbThumbnailData);
-      if (isOperatorAuthored && differs) {
-        const processedLocalBuffer = await readAndProcessThumbnail(localThumbnailPath, localFileBuffer);
-        if (processedLocalBuffer) {
-          db.prepare('UPDATE courses SET thumbnail_data = ? WHERE id = ?').run(processedLocalBuffer, courseId);
-        }
-      }
-      // Otherwise: round-tripped thumbnail.png whose contents diverged from
-      // the DB blob (e.g. admin-uploaded after the file was already on disk).
-      // Keep DB-as-authority; the edit process is the source of truth.
-    }
-  } catch (error) {
-    console.error(`Error synchronizing thumbnail for course ${courseId} (${courseFolderName}):`, error);
+  } else if (!row?.thumbnail_data) {
+    const generated = await extractFrameThumbnail(firstVideoPath(coursePath, courseData));
+    if (generated) db.prepare('UPDATE courses SET thumbnail_data=? WHERE id=?').run(generated, courseId);
   }
 }
 
-// Process new or changed course directories without preserving metadata:
-// any cached thumbnail blob is cleared so synchronizeCourseThumbnail
-// re-derives it from disk (or a video frame).
-const processCourseDirectory = async (courseDirPath) => {
-  try {
-    const courseDir = path.basename(courseDirPath);
-
-    // Only scan directory structure to get basic course info
-    const courseData = await generateCourseJson(courseDir, courseDirPath);
-
-    if (courseData) {
-      const result = saveCourseToDb(courseData, courseDir);
-      if (result.error) {
-        console.error(`Failed to save course ${courseDir} to database: ${result.error}`);
-        return { success: false };
-      }
-      const db = getDb();
-      db.prepare('UPDATE courses SET thumbnail_data = NULL WHERE id = ?').run(courseData.id);
-
-      // After saving basic course data, synchronize the thumbnail
-      await synchronizeCourseThumbnail(courseData.id, courseDir, courseData);
-      return { success: true, courseId: courseData.id };
-    }
-  } catch (error) {
-    console.error(`Error processing course directory ${courseDirPath}:`, error);
+async function processCourse(root, relativePath, preserveMetadata = true) {
+  const coursePath = path.join(root.canonicalPath, relativePath);
+  const courseId = deriveCourseId(root.id, relativePath);
+  const generated = await generateCourseJson(path.basename(relativePath), coursePath, courseId);
+  const db = getDb();
+  const existing = db.prepare(`SELECT title, description, category, release_date FROM courses WHERE id=?`).get(courseId);
+  let courseData = generated;
+  if (preserveMetadata && existing) {
+    const pinned = jsonPinnedFields(coursePath);
+    courseData = {
+      ...generated,
+      title: pinned.has('title') ? generated.title : (existing.title || generated.title),
+      description: pinned.has('description') ? generated.description : (existing.description || generated.description),
+      category: pinned.has('category') ? generated.category : (existing.category || generated.category),
+      releaseDate: pinned.has('releaseDate') ? generated.releaseDate : (existing.release_date || generated.releaseDate)
+    };
   }
-  return { success: false };
-};
+  const result = saveCourseToDb(courseData, { rootId: root.id, relativePath });
+  if (result.error) throw new Error(result.error);
+  if (!preserveMetadata) db.prepare('UPDATE courses SET thumbnail_data=NULL WHERE id=?').run(courseId);
+  await synchronizeCourseThumbnail(courseId, coursePath, courseData);
+  return courseId;
+}
 
-// Custom processing for preserving metadata
-const processCourseDirWithMetadataPreservation = async (courseDirPath, existingCourses) => {
-  try {
-    const courseDir = path.basename(courseDirPath);
-    const courseId = generateCourseId(courseDir);
+function discoverRoot(root) {
+  return fs.readdirSync(root.canonicalPath, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith('.'))
+    .map(entry => entry.name);
+}
 
-    const existingCourseResult = existingCourses.find(c => c.id === courseId);
-    const courseData = await generateCourseJson(courseDir, courseDirPath);
-
-    if (existingCourseResult && courseData) {
-      // course.json (already applied inside generateCourseJson) is the source of
-      // truth when present. DB-preserved metadata is the fallback for fields that
-      // the operator did NOT pin in course.json.
-      const jsonPinned = readCourseJsonKeys(courseDirPath);
-
-      const updatedCourseData = {
-        ...courseData,
-        title: jsonPinned.has('title')
-          ? courseData.title
-          : (existingCourseResult.title || courseData.title),
-        description: jsonPinned.has('description')
-          ? courseData.description
-          : (existingCourseResult.description || courseData.description),
-        category: jsonPinned.has('category')
-          ? courseData.category
-          : (existingCourseResult.category || courseData.category),
-        releaseDate: jsonPinned.has('releaseDate')
-          ? courseData.releaseDate
-          : (existingCourseResult.release_date || courseData.releaseDate),
-      };
-
-      // saveCourseToDb does not accept a third "preserveMetadata" arg —
-      // its UPDATE statement already excludes thumbnail_data so existing
-      // blob data survives unchanged. synchronizeCourseThumbnail handles
-      // the actual data sync afterwards.
-      const result = saveCourseToDb(updatedCourseData, courseDir);
-      if (result.error) {
-        console.error(`Failed to save course ${courseDir} to database: ${result.error}`);
-        return;
-      }
-      // After saving/updating course data, synchronize the thumbnail
-      await synchronizeCourseThumbnail(updatedCourseData.id, courseDir, updatedCourseData);
-
-    } else if (courseData) {
-      // New course or no existing metadata to preserve, treat as new
-      // saveCourseToDb's INSERT branch sets thumbnail_data to NULL initially.
-      const result = saveCourseToDb(courseData, courseDir);
-      if (result.error) {
-        console.error(`Failed to save course ${courseDir} to database: ${result.error}`);
-        return;
-      }
-      // After saving basic course data, synchronize the thumbnail
-      await synchronizeCourseThumbnail(courseData.id, courseDir, courseData);
-    } else {
-      console.warn(`Could not generate course data for ${courseDir} during metadata preservation.`);
-    }
-  } catch (error) {
-    console.error(`Error in processCourseDirWithMetadataPreservation for ${courseDirPath}:`, error);
-  }
-};
-
-// Handle course directory removal
-const handleCourseDirectoryRemoval = (dirPath) => {
-  try {
-    const courseDir = path.basename(dirPath);
-    const contentDir = getContentDir();
-    
-    // Check if this is a course directory (parent should be content)
-    if (path.dirname(dirPath) === contentDir) {
-      console.log(`Course directory removed: ${courseDir}`);
-      removeCourseFromDb(courseDir);
-    }
-  } catch (error) {
-    console.error(`Error handling course directory removal: ${error.message}`);
-  }
-};
-
-// Function to scan courses on startup
 export const scanCoursesOnStartup = async (forceRescan = false, preserveMetadata = true) => {
+  if (initialScanStatus.inProgress && !forceRescan) return false;
+  initialScanStatus.inProgress = true;
+  initialScanStatus.complete = false;
+  initialScanStatus.startTime = Date.now();
+  initialScanStatus.processedCourses = 0;
+  initialScanStatus.processedRoots = 0;
+  initialScanStatus.error = null;
+  initialScanStatus.preserveMetadata = preserveMetadata;
   try {
-    // If a scan is already in progress and this is not a force rescan, don't start another one
-    if (initialScanStatus.inProgress && !forceRescan) {
-      console.log('Scan already in progress, skipping duplicate scan request');
-      return;
+    const roots = parseContentRoots();
+    const db = getDb();
+    synchronizeContentRoots(db, roots);
+    const discovered = roots.map(root => ({ root, courses: discoverRoot(root) }));
+    initialScanStatus.totalRoots = roots.length;
+    initialScanStatus.totalCourses = discovered.reduce((sum, item) => sum + item.courses.length, 0);
+    const seen = new Set();
+    for (const { root, courses } of discovered) {
+      for (const relativePath of courses) {
+        await processCourse(root, relativePath, preserveMetadata);
+        seen.add(`${root.id}\0${relativePath}`);
+        initialScanStatus.processedCourses += 1;
+      }
+      initialScanStatus.processedRoots += 1;
     }
-
-    // Set initial scan status for a full scan
-    initialScanStatus.inProgress = true;
-    initialScanStatus.complete = false;
-    initialScanStatus.startTime = Date.now();
-    initialScanStatus.processedCourses = 0;
-    initialScanStatus.error = null;
-    initialScanStatus.preserveMetadata = preserveMetadata;
-    
-    console.log(`Beginning course scan of ${getContentDir()} with preserveMetadata=${preserveMetadata}...`);
-    const contentDir = getContentDir();
-    const courseDirs = fs.readdirSync(contentDir, { withFileTypes: true })
-      .filter(dirent => dirent.isDirectory())
-      .filter(dirent => !dirent.name.startsWith('.')) // Ignore directories starting with a dot (like .Recycle.Bin)
-      .map(dirent => dirent.name);
-
-    initialScanStatus.totalCourses = courseDirs.length;
-
-    // Fetch existing courses from DB if preserving metadata
-    let existingCourses = []; // Initialize as an empty array
-    if (preserveMetadata) {
-      try {
-        const db = getDb();
-        // This should fetch all relevant fields for comparison, as an array
-        existingCourses = db.prepare('SELECT id, title, description, category, release_date, folder_name, thumbnail_data FROM courses').all();
-      } catch (dbError) {
-        console.error('Error fetching existing courses from DB:', dbError);
-        // Continue with an empty existingCourses array if DB fetch fails, 
-        // effectively treating all courses as new for this scan pass.
-        existingCourses = []; 
+    for (const course of getCoursesWithDirectories(db)) {
+      if (!seen.has(`${course.content_root_id}\0${course.relative_path}`)) {
+        markCourseUnavailable(course.content_root_id, course.relative_path, db);
       }
     }
-
-    for (const courseDir of courseDirs) {
-      const courseDirPath = path.join(contentDir, courseDir);
-      try {
-        if (preserveMetadata) {
-          // Custom processing for preserving metadata, passing the array
-          await processCourseDirWithMetadataPreservation(courseDirPath, existingCourses);
-        } else {
-          // Standard processing that resets metadata
-          await processCourseDirectory(courseDirPath);
-        }
-        
-        initialScanStatus.processedCourses++;
-      } catch (error) {
-        console.error(`Error processing course directory ${courseDir}:`, error);
-      }
-    }
-    
-    // Clean up courses that no longer exist in the filesystem
-    await cleanupRemovedCourses(courseDirs);
-    
-    // Finalize scan status
     initialScanStatus.complete = true;
-    initialScanStatus.inProgress = false;
     initialScanStatus.endTime = Date.now();
-    const duration = (initialScanStatus.endTime - initialScanStatus.startTime) / 1000;
-    console.log(`Course scan completed in ${duration.toFixed(2)} seconds. Processed ${initialScanStatus.processedCourses} of ${initialScanStatus.totalCourses} courses.`);
-    
     return true;
   } catch (error) {
     console.error('Error during course scan:', error);
     initialScanStatus.error = error.message || 'Unknown error during scan';
-    initialScanStatus.inProgress = false;
     initialScanStatus.complete = false;
     return false;
+  } finally {
+    initialScanStatus.inProgress = false;
   }
 };
 
+const DEBOUNCE_MS = 2000;
+const pending = new Map();
 
-// Function to clean up courses that no longer exist in the filesystem
-const cleanupRemovedCourses = (existingCourseDirs) => {
-  try {
-    // Get all courses from the database with their directory names
-    const coursesWithDirs = getCoursesWithDirectories();
-    const onDiskIds = new Set(existingCourseDirs.map(generateCourseId));
-    
-    // Check each course in the database
-    for (const course of coursesWithDirs) {
-      if (!existingCourseDirs.includes(course.folder_name)) {
-        // A different folder generating the same ID was rejected earlier in
-        // this scan. Keep the existing row and its progress until the
-        // operator resolves the ambiguous folder names; cleanup must not turn
-        // a safely rejected collision into data loss.
-        if (onDiskIds.has(course.id)) {
-          console.warn(
-            `Keeping missing course folder "${course.folder_name}" because an on-disk folder collides with ID "${course.id}".`
-          );
-          continue;
-        }
-        console.log(`Removing deleted course from database: ${course.folder_name}`);
-        removeCourseFromDb(course.folder_name);
-      }
-    }
-  } catch (error) {
-    console.error('Error during course cleanup:', error);
-  }
-};
-
-// Debounce before processing newly added course directories so half-copied
-// courses aren't indexed instantly.
-const ADD_DIR_DEBOUNCE_MS = 2000;
-const pendingAddDirTimers = new Map();
-
-// Set up file watching. The polling interval is parsed once by the caller
-// (server/plugins/courseScanner.js) from CHOKIDAR_POLLING_INTERVAL.
 export const setupFileWatcher = (pollingInterval = 60000) => {
   try {
-    const contentDir = getContentDir();
-    console.log(`Setting up course watcher on: ${contentDir}`);
-
-    // Watch nested course changes and debounce them by top-level course.
-    const watcher = chokidar.watch(contentDir, {
-      ignored: /(^|[\/\\])\../, // Ignore dotfiles
-      persistent: true,
-      ignoreInitial: true,
-      usePolling: true, // Enable polling for reliability in Docker
-      interval: pollingInterval // Use configured interval
+    const roots = parseContentRoots();
+    const watcher = chokidar.watch(roots.map(root => root.canonicalPath), {
+      ignored: /(^|[\/\\])\../, persistent: true, ignoreInitial: true,
+      followSymlinks: false, usePolling: true, interval: pollingInterval
     });
-
-    const scheduleRescan = (changedPath) => {
-      const coursePath = topLevelCoursePath(contentDir, changedPath);
+    const schedule = (changedPath) => {
+      const root = findOwningRoot(roots, changedPath);
+      if (!root) return;
+      const coursePath = topLevelCoursePath(root.canonicalPath, changedPath);
       if (!coursePath) return;
-      clearTimeout(pendingAddDirTimers.get(coursePath));
-      pendingAddDirTimers.set(coursePath, setTimeout(() => {
-        pendingAddDirTimers.delete(coursePath);
-        fs.promises.access(coursePath)
-          .then(async () => {
-            const courseId = generateCourseId(path.basename(coursePath));
-            const existing = getDb().prepare(`
-              SELECT id, title, description, category, release_date, folder_name, thumbnail_data
-              FROM courses WHERE id = ?
-            `).all(courseId);
-            if (existing.length > 0) {
-              await processCourseDirWithMetadataPreservation(coursePath, existing);
-            } else {
-              await processCourseDirectory(coursePath);
-            }
-          })
-          .catch(error => {
-            if (error?.code === 'ENOENT') handleCourseDirectoryRemoval(coursePath);
-            else console.error(`Error processing course directory ${coursePath}:`, error);
-          });
-      }, ADD_DIR_DEBOUNCE_MS));
+      const relativePath = path.relative(root.canonicalPath, coursePath);
+      const key = `${root.id}\0${relativePath}`;
+      clearTimeout(pending.get(key));
+      pending.set(key, setTimeout(async () => {
+        pending.delete(key);
+        try {
+          fs.accessSync(root.canonicalPath, fs.constants.R_OK | fs.constants.X_OK);
+        } catch {
+          getDb().prepare('UPDATE content_roots SET is_available=0, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(root.id);
+          return;
+        }
+        getDb().prepare(`
+          UPDATE content_roots SET is_available=1, last_seen_at=CURRENT_TIMESTAMP,
+            updated_at=CURRENT_TIMESTAMP WHERE id=? AND is_configured=1
+        `).run(root.id);
+        try {
+          if (fs.lstatSync(coursePath).isDirectory()) await processCourse(root, relativePath, true);
+          else markCourseUnavailable(root.id, relativePath);
+        } catch (error) {
+          if (error.code === 'ENOENT') markCourseUnavailable(root.id, relativePath);
+          else console.error(`Error processing course ${key}:`, error);
+        }
+      }, DEBOUNCE_MS));
     };
-
-    watcher.on('add', scheduleRescan);
-    watcher.on('change', scheduleRescan);
-    watcher.on('unlink', scheduleRescan);
-    watcher.on('addDir', scheduleRescan);
-    watcher.on('unlinkDir', scheduleRescan);
-
-    // Handle errors
-    watcher.on('error', error => {
-      console.error('Course watcher error:', error);
-    });
-
-    console.log('Course watcher set up successfully');
+    for (const eventName of ['add', 'change', 'unlink', 'addDir', 'unlinkDir']) watcher.on(eventName, schedule);
+    watcher.on('error', error => console.error('Course watcher error:', error));
     return watcher;
   } catch (error) {
     console.error('Error setting up course watcher:', error);

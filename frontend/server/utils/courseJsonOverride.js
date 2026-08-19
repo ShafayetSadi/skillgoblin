@@ -1,5 +1,16 @@
 import fs from 'fs';
 import path from 'path';
+import { pathIsWithin } from './contentRoots.js';
+
+function safeCourseJsonPath(courseFolderPath) {
+  try {
+    const root = fs.realpathSync.native(courseFolderPath);
+    const target = fs.realpathSync.native(path.join(courseFolderPath, 'course.json'));
+    return pathIsWithin(root, target) ? target : null;
+  } catch {
+    return null;
+  }
+}
 
 // Allowed keys in course.json. Anything else is rejected with a warning.
 export const ALLOWED = ['title', 'description', 'category', 'releaseDate'];
@@ -14,7 +25,7 @@ function isString(v) {
 // O(1) — single existsSync. Used by the has-json endpoint.
 export function hasCourseJson(courseFolderPath) {
   try {
-    return fs.existsSync(path.join(courseFolderPath, 'course.json'));
+    return Boolean(safeCourseJsonPath(courseFolderPath));
   } catch {
     return false;
   }
@@ -25,7 +36,8 @@ export function hasCourseJson(courseFolderPath) {
 // failure (missing file, bad JSON, wrong shape) after logging a warning so
 // an operator can debug without crashing the scan.
 export function readCourseJson(courseFolderPath) {
-  const filePath = path.join(courseFolderPath, 'course.json');
+  const filePath = safeCourseJsonPath(courseFolderPath);
+  if (!filePath) return null;
   let raw;
   try {
     raw = fs.readFileSync(filePath, 'utf8');
@@ -52,7 +64,7 @@ export function readCourseJson(courseFolderPath) {
   return parsed;
 }
 
-// Build the course.json object that gets written to disk on export. Limited
+// Build the course.json object returned by the metadata export. Limited
 // to the four allowed fields — id, lessons, thumbnail are *not* exported
 // because they are derived from folder structure and the thumbnail.png
 // convention.

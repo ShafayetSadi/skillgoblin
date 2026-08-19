@@ -30,6 +30,7 @@ services:
       - PORT=3000
       - NODE_ENV=production
       - DATABASE_PATH=/app/data/database/database.sqlite
+      - CONTENT_DIRS=primary=/courses/primary,secondary=/courses/secondary
       # The bootstrap server-plugin requires both vars on a fresh install.
       # Tests use these credentials in tests/e2e/auth.spec.js — keep them
       # in sync with PW_ADMIN_NAME / PW_ADMIN_PASSWORD on the tests service.
@@ -50,7 +51,8 @@ services:
         tmpfs:
           mode: 01777
       - ./frontend/tests/fixtures/branding:/app/data/branding
-      - ./frontend/tests/fixtures/content:/app/data/content
+      - ./frontend/tests/fixtures/content:/courses/primary:ro
+      - ./frontend/tests/fixtures/content:/courses/secondary:ro
     healthcheck:
       # 127.0.0.1 (not localhost) because busybox wget on alpine resolves
       # localhost to [::1] first and the server is bound to 0.0.0.0 only.
@@ -81,6 +83,9 @@ services:
       - -lc
       - |
         set -e
+        echo "[tests] ensuring native-addon build tools are available"
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends make g++
         echo "[tests] installing deps"
         npm install --no-audit --no-fund
         echo "[tests] running vitest unit suite"

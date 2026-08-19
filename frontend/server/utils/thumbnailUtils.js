@@ -3,7 +3,7 @@ import path from 'path';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 import sharp from 'sharp';
-import { resolveCourseDir } from './courseHelpers';
+import { pathIsWithin } from './contentRoots.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -15,14 +15,6 @@ const execFileAsync = promisify(execFile);
  * @param {string} courseFolderName - The name of the course folder.
  * @returns {string|null} Absolute path to the course's root directory, or null on invalid input.
  */
-export const getCourseRootPath = (courseFolderName) => {
-  try {
-    return resolveCourseDir(courseFolderName);
-  } catch {
-    return null;
-  }
-};
-
 /**
  * Plex-style local-asset detection. Priority order: explicit `thumbnail.*`
  * first (the historical canonical name), then the conventional `cover.*` /
@@ -74,7 +66,10 @@ export const findLocalThumbnailPath = (courseRoot) => {
       if (!realName) continue;
       const full = path.join(courseRoot, realName);
       try {
-        const stat = fs.statSync(full);
+        const canonicalRoot = fs.realpathSync.native(courseRoot);
+        const canonicalFile = fs.realpathSync.native(full);
+        if (!pathIsWithin(canonicalRoot, canonicalFile)) continue;
+        const stat = fs.statSync(canonicalFile);
         if (stat.size > 0) return full;
       } catch (err) {
         if (err.code !== 'ENOENT') {

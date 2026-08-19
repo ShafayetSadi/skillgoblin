@@ -2,6 +2,12 @@ FROM node:24-alpine@sha256:2bdb65ed1dab192432bc31c95f94155ca5ad7fc1392fb7eb7526a
 
 WORKDIR /app
 
+# Native dependencies normally download prebuilt binaries, but retain the
+# standard node-gyp toolchain in the builder so transient prebuild outages do
+# not make production images impossible to build. These packages do not carry
+# into the final runtime stage.
+RUN apk add --no-cache python3 make g++
+
 # Copy package files + .npmrc first for better caching. The .npmrc sets
 # legacy-peer-deps=true so npm ci tolerates Nuxt 4's optional peer dep
 # chain (e.g. @bomb.sh/tab declares commander@^13 as an optional peer

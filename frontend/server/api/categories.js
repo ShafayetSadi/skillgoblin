@@ -11,7 +11,10 @@ export default defineEventHandler(async (event) => {
   
   try {
     // Extract all unique categories from courses
-    const courses = db.prepare('SELECT data FROM courses').all();
+    const courses = db.prepare(`
+      SELECT c.data FROM courses c JOIN content_roots r ON r.id=c.content_root_id
+      WHERE c.is_available=1 AND r.is_configured=1 AND r.is_available=1
+    `).all();
     
     courses.forEach(course => {
       try {

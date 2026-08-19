@@ -3,7 +3,7 @@ import path from 'path';
 import { defineEventHandler, getRequestURL, createError, setResponseHeader, getRequestHeaders } from 'h3';
 import zlib from 'zlib';
 import { getDb } from '../../utils/db'; // Added for database access
-import { getContentDir, generateCourseId, resolveCourseById, resolveCourseDir, resolvePathInCourse, VIDEO_EXTENSIONS } from '../../utils/courseHelpers';
+import { resolveCourseById, resolvePathInCourse, resolveExistingPathInCourse, VIDEO_EXTENSIONS } from '../../utils/courseHelpers';
 import { loadThumbnail } from '../../utils/thumbnailUtils';
 import { parseSingleByteRange } from '../../utils/httpRange.js';
 import { requireAuth } from '../../utils/authz.js';
@@ -147,7 +147,12 @@ export default defineEventHandler(async (event) => {
     pathSegments.shift(); // Remove 'content'
     
     // Decode URL components to handle spaces and special characters
-    const decodedSegments = pathSegments.map(segment => decodeURIComponent(segment));
+    let decodedSegments;
+    try {
+      decodedSegments = pathSegments.map(segment => decodeURIComponent(segment));
+    } catch {
+      throw createError({ statusCode: 400, statusMessage: 'Invalid content path' });
+    }
     
     const courseIdFromPath = decodedSegments[0]; // Get potential course ID from path
     
@@ -206,45 +211,10 @@ export default defineEventHandler(async (event) => {
     // --- END THUMBNAIL HANDLING ---
     
     // --- BEGIN NON-THUMBNAIL FILE HANDLING (Filesystem based) ---
-    // Find the actual folder name that matches the course ID
-    let actualCourseFolder = null;
-    let courseDir = null;
-    try {
-      ({ folderName: actualCourseFolder, courseDir } = resolveCourseById(db, courseIdFromPath));
-    } catch (err) {
-      if (err?.statusCode !== 404) throw err;
-      // Fallback: Scan directories if not found in DB (legacy support? or error?)
-      console.warn(`Course ID ${courseIdFromPath} not found in DB or missing folder_name, attempting filesystem scan...`);
-      const courseDirs = (await fs.promises.readdir(getContentDir(), { withFileTypes: true }))
-        .filter(dirent => dirent.isDirectory())
-        .map(dirent => dirent.name);
-      for (const dir of courseDirs) {
-        if (generateCourseId(dir) === courseIdFromPath) {
-          actualCourseFolder = dir;
-          break;
-        }
-      }
-    }
-
-    if (!actualCourseFolder) {
-      console.error(`Course folder could not be determined for ID: ${courseIdFromPath}`);
-      throw createError({
-        statusCode: 404,
-        statusMessage: 'Course not found'
-      });
-    }
-
-    // Construct the path to the content file
-    if (!courseDir) {
-      try {
-        courseDir = resolveCourseDir(actualCourseFolder);
-      } catch (err) {
-        throw createError({ statusCode: 400, statusMessage: 'Invalid course folder' });
-      }
-    }
+    const course = resolveCourseById(db, courseIdFromPath);
     let filePath;
     try {
-      filePath = resolvePathInCourse(courseDir, ...decodedSegments.slice(1));
+      filePath = resolvePathInCourse(course, ...decodedSegments.slice(1)).candidate;
     } catch (err) {
       throw createError({ statusCode: 400, statusMessage: 'Invalid content path' });
     }
@@ -252,17 +222,21 @@ export default defineEventHandler(async (event) => {
     // Get file stats (a single stat doubles as the existence check)
     let stats = null;
     try {
+      filePath = resolveExistingPathInCourse(course, ...decodedSegments.slice(1));
       stats = await fs.promises.stat(filePath);
     } catch (err) {
-      if (err.code !== 'ENOENT') throw err;
+      if (err.code !== 'ENOENT' && err.statusCode !== 404) throw err;
     }
 
     // .vtt requests: if the file doesn't exist on disk but a sibling .srt does,
     // convert and serve. This lets operators drop an .srt next to the video and
     // have the player consume a real WebVTT track.
     if (!stats && path.extname(filePath).toLowerCase() === '.vtt') {
-      const srtCandidate = filePath.slice(0, -4) + '.srt';
+      const subtitleSegments = decodedSegments.slice(1);
+      subtitleSegments[subtitleSegments.length - 1] = subtitleSegments.at(-1).slice(0, -4) + '.srt';
+      let srtCandidate;
       try {
+        srtCandidate = resolveExistingPathInCourse(course, ...subtitleSegments);
         const { convertSrtFileToVtt } = await import('../../utils/srtToVtt.js');
         const vttBuffer = await convertSrtFileToVtt(srtCandidate, fs);
         setResponseHeader(event, 'Content-Type', 'text/vtt; charset=utf-8');
@@ -270,7 +244,7 @@ export default defineEventHandler(async (event) => {
         setResponseHeader(event, 'Cache-Control', 'private, max-age=600');
         return vttBuffer;
       } catch (err) {
-        if (err && err.code === 'ENOENT') {
+        if (err && (err.code === 'ENOENT' || err.statusCode === 404)) {
           // No .srt sibling — fall through to the normal not-found handling below.
         } else {
           console.error(`SRT to VTT conversion failed for ${srtCandidate}:`, err);
@@ -286,6 +260,7 @@ export default defineEventHandler(async (event) => {
         statusMessage: 'File not found'
       });
     }
+    if (!stats.isFile()) throw createError({ statusCode: 400, statusMessage: 'Not a file' });
 
     // Determine content type based on file extension
     let contentType = 'application/octet-stream';

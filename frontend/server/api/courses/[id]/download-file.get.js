@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { getDb } from '../../../utils/db';
-import { resolveCourseById, resolvePathInCourse } from '../../../utils/courseHelpers';
+import { resolveCourseById, resolveExistingPathInCourse } from '../../../utils/courseHelpers';
 import { requireAuth } from '../../../utils/authz';
 import { sendStream } from 'h3';
 
@@ -16,13 +16,13 @@ export default defineEventHandler(async (event) => {
   }
 
   const db = getDb();
-  const { courseDir: courseBasePath } = resolveCourseById(db, courseId, {
+  const course = resolveCourseById(db, courseId, {
     notFoundMessage: 'Course or course folder not found.'
   });
 
   let absoluteFilePath;
   try {
-    absoluteFilePath = resolvePathInCourse(courseBasePath, filePathRelative);
+    absoluteFilePath = resolveExistingPathInCourse(course, filePathRelative);
   } catch {
     throw createError({ statusCode: 400, statusMessage: 'Invalid file path' });
   }

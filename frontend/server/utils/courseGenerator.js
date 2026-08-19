@@ -1,10 +1,20 @@
 import fs from 'fs';
 import path from 'path';
-import { generateCourseId, naturalSort, VIDEO_EXTENSIONS } from './courseHelpers';
+import { naturalSort, VIDEO_EXTENSIONS } from './courseHelpers';
 import { applyCourseJsonOverride } from './courseJsonOverride.js';
+import { pathIsWithin } from './contentRoots.js';
 
 function isVideoFile(name) {
   return VIDEO_EXTENSIONS.has(path.extname(name).toLowerCase());
+}
+
+async function safeFile(coursePath, candidate) {
+  try {
+    const [root, target] = await Promise.all([fs.promises.realpath(coursePath), fs.promises.realpath(candidate)]);
+    return pathIsWithin(root, target);
+  } catch {
+    return false;
+  }
 }
 
 function stripVideoExt(name) {
@@ -42,6 +52,7 @@ export const generateLessonsFromFolder = async (coursePath) => {
   if (rootVideos.length > 0) {
     const introVideos = await Promise.all(rootVideos.map(async (video) => {
       const fullPath = path.join(coursePath, video.name);
+      if (!await safeFile(coursePath, fullPath)) return null;
       const subtitle = await findSubtitleSibling(fullPath);
       const entry = {
         title: stripVideoExt(video.name).replace(/_/g, ' '),
@@ -51,14 +62,14 @@ export const generateLessonsFromFolder = async (coursePath) => {
       return entry;
     }));
 
-    introVideos.sort((a, b) => naturalSort(a, b));
+    const safeIntroVideos = introVideos.filter(Boolean);
+    safeIntroVideos.sort((a, b) => naturalSort(a, b));
 
-    lessons.push({
-      id: 'main-content',
-      title: 'Main Content',
-      folder: '',
-      videos: introVideos,
-    });
+    if (safeIntroVideos.length > 0) {
+      lessons.push({
+        id: 'main-content', title: 'Main Content', folder: '', videos: safeIntroVideos,
+      });
+    }
   }
 
   for (const lessonDir of lessonDirs) {
@@ -69,6 +80,7 @@ export const generateLessonsFromFolder = async (coursePath) => {
         .filter((item) => !item.isDirectory() && isVideoFile(item.name))
         .map(async (video) => {
           const fullPath = path.join(lessonPath, video.name);
+          if (!await safeFile(coursePath, fullPath)) return null;
           const subtitle = await findSubtitleSibling(fullPath);
           const entry = {
             title: stripVideoExt(video.name).replace(/_/g, ' '),
@@ -79,20 +91,21 @@ export const generateLessonsFromFolder = async (coursePath) => {
         }),
     );
 
-    if (lessonVideos.length > 0) {
+    const safeLessonVideos = lessonVideos.filter(Boolean);
+    if (safeLessonVideos.length > 0) {
       const lessonId = lessonDir.name
         .toLowerCase()
         .replace(/[^a-z0-9\s-]/g, '')
         .replace(/\s+/g, '-')
         .replace(/-+/g, '-');
 
-      lessonVideos.sort((a, b) => naturalSort(a, b));
+      safeLessonVideos.sort((a, b) => naturalSort(a, b));
 
       lessons.push({
         id: lessonId,
         title: lessonDir.name,
         folder: lessonDir.name,
-        videos: lessonVideos,
+        videos: safeLessonVideos,
       });
     }
   }
@@ -103,8 +116,8 @@ export const generateLessonsFromFolder = async (coursePath) => {
 
 // Generate course metadata from folder structure, then layer course.json
 // overrides on top so the operator's intent wins over auto-detection.
-export const generateCourseJson = async (courseDir, coursePath) => {
-  const courseId = generateCourseId(courseDir);
+export const generateCourseJson = async (courseDir, coursePath, courseId) => {
+  if (!courseId) throw new Error('A scanner-assigned course ID is required');
   const lessons = await generateLessonsFromFolder(coursePath);
 
   const autoDetected = {

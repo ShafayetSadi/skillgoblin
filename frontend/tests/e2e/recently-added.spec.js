@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 
 // PR-D e2e: validates the newest-first sort and the NEW badge. The dockerized
-// test stack mounts `frontend/tests/fixtures/content` at `/app/data/content`
+// test stack mounts the fixture as two read-only named content roots
 // (see docker-compose.test.yml). A `beforeAll` triggers a rescan so the
 // fixture course is in the DB before assertions.
 
