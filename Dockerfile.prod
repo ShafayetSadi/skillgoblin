@@ -16,7 +16,10 @@ RUN apk add --no-cache python3 make g++
 COPY frontend/package*.json frontend/.npmrc ./
 
 # Install dependencies
-RUN npm ci
+# npm silently skips optional dependencies whose download fails, which would
+# leave sharp without libvips and crash the server at startup. The check shares
+# this RUN so a bad install is never cached as a good layer.
+RUN npm ci && test -f node_modules/@img/sharp-libvips-linuxmusl-x64/lib/index.js
 
 # Copy application code
 COPY frontend ./
@@ -49,6 +52,11 @@ COPY --from=builder --chown=node:node /app/server/utils ./server/utils
 COPY --from=builder --chown=node:node /app/server/migrations ./server/migrations
 COPY --from=builder /app/package.json ./package.json
 RUN ln -s /app/.output/server/node_modules /app/node_modules
+
+# sharp's native addon dlopen()s libvips through a relative rpath, so Nitro's
+# import tracer never copies the libvips package into .output. Without it the
+# server crash-loops with "Error loading shared library libvips-cpp.so".
+COPY --from=builder --chown=node:node /app/node_modules/@img/sharp-libvips-linuxmusl-x64 ./.output/server/node_modules/@img/sharp-libvips-linuxmusl-x64
 
 # Copy public directory and static assets
 COPY --chown=node:node frontend/public ./public
