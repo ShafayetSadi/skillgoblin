@@ -82,6 +82,8 @@
         :is-completed="!!completedVideos[currentVideoId]" 
         :progress-percentage="videoProgress[currentVideoId] || 0"
       />
+
+      <CourseDescription :description="course?.description" />
       
       <!-- Lesson search — filters lesson titles AND video titles inside each
            lesson. While a query is active, every lesson with at least one
@@ -232,6 +234,7 @@ import { useSession } from '~/composables/useSession';
 import { useAccountActions } from '~/composables/useAccountActions';
 import CourseFilesModal from '~/components/CourseFilesModal.vue';
 import CourseHeader from '../../components/course/CourseHeader.vue';
+import CourseDescription from '../../components/course/CourseDescription.vue';
 import VideoPlayer from '../../components/video/VideoPlayer.vue';
 import VideoInfo from '../../components/video/VideoInfo.vue';
 import { pickNextNotCompleted } from '~/utils/smartOpen.js';

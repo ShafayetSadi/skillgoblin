@@ -72,6 +72,9 @@
           placeholder="Course description"
           required
         ></textarea>
+        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+          Markdown is supported. Add resources with <code>[Slides](https://example.com)</code>.
+        </p>
       </div>
 
       <!-- Thumbnail -->

@@ -271,6 +271,9 @@ console warning. The thumbnail and lessons are still derived from the folder
 structure. The opaque course ID is derived from the named root plus relative
 course path and is never read from `course.json`.
 
+Course descriptions support Markdown on the detail page, including links such
+as `[Slides](https://example.com/slides)`.
+
 #### Exporting from the admin panel
 
 Content roots are never modified. Admins can download a versioned metadata
