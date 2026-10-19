@@ -3,6 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { generateLessonsFromFolder } from '../../server/utils/courseGenerator.js';
+import { generateCourseId } from '../../server/utils/courseHelpers.js';
 
 // Filesystem-driven tests for the lesson generator. Each test builds a
 // throwaway course folder under os.tmpdir(), runs the real readdirSync code
@@ -13,6 +14,8 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sg-cg-'));
 });
 afterEach(() => {
+  delete process.env.SUBTITLE_LANGUAGE;
+  delete process.env.SUBTITLE_LABEL;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -90,6 +93,21 @@ describe('generateLessonsFromFolder', () => {
       title: '01-intro',
       file: '01-intro.mkv',
       subtitle: '01-intro.vtt',
+      subtitleLanguage: 'en',
+      subtitleLabel: 'en',
+    });
+  });
+
+  it('uses configured subtitle language metadata', async () => {
+    process.env.SUBTITLE_LANGUAGE = 'ru';
+    process.env.SUBTITLE_LABEL = 'Русский';
+    touch('Lesson 1/01-intro.mp4');
+    touch('Lesson 1/01-intro.srt');
+    const lessons = await generateLessonsFromFolder(tmpDir);
+    expect(lessons[0].videos[0]).toMatchObject({
+      subtitle: '01-intro.vtt',
+      subtitleLanguage: 'ru',
+      subtitleLabel: 'Русский',
     });
   });
 
@@ -104,5 +122,34 @@ describe('generateLessonsFromFolder', () => {
     touch('my_intro_clip.mp4');
     const lessons = await generateLessonsFromFolder(tmpDir);
     expect(lessons[0].videos[0].title).toBe('my intro clip');
+  });
+
+  it('never produces duplicate or empty lesson ids', async () => {
+    touch('root.mp4');
+    touch('Main Content/video.mp4');
+    touch('日本語/video.mp4');
+    touch('1. Intro/video.mp4');
+    touch('1 - Intro/video.mp4');
+
+    const lessons = await generateLessonsFromFolder(tmpDir);
+    const ids = lessons.map(lesson => lesson.id);
+    expect(ids.every(Boolean)).toBe(true);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+describe('generateCourseId', () => {
+  it('preserves the legacy id for safe ASCII names', () => {
+    expect(generateCourseId('Course Alpha 2')).toBe('course-alpha-2');
+  });
+
+  it('returns deterministic non-empty ids for non-Latin and punctuation-only names', () => {
+    expect(generateCourseId('日本語')).toMatch(/^日本語-[a-f0-9]{8}$/);
+    expect(generateCourseId('!!!')).toMatch(/^course-[a-f0-9]{8}$/);
+    expect(generateCourseId('日本語')).toBe(generateCourseId('日本語'));
+  });
+
+  it('keeps names that used to collide distinct', () => {
+    expect(generateCourseId('C++')).not.toBe(generateCourseId('C#'));
   });
 });

@@ -1,9 +1,10 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createServer } from 'node:http';
 import { createApp, toNodeListener } from 'h3';
 import { v4 as uuidv4 } from 'uuid';
 import { getDb } from '../../server/utils/db.js';
 import handler from '../../server/api/users/bootstrap-credentials.post.js';
+import { _resetForTests } from '../../server/utils/rate-limit.js';
 
 let server;
 let baseUrl;
@@ -23,25 +24,30 @@ afterAll(async () => {
   await new Promise(resolve => server.close(resolve));
 });
 
-function insertLegacyUser({ active }) {
+function insertLegacyUser({ active, admin = false }) {
   const id = uuidv4();
   createdIds.push(id);
   getDb().prepare(`
     INSERT INTO users (id, name, password, pin, isAdmin, is_active)
-    VALUES (?, ?, NULL, NULL, 0, ?)
-  `).run(id, `legacy-${id}`, active ? 1 : 0);
+    VALUES (?, ?, NULL, NULL, ?, ?)
+  `).run(id, `legacy-${id}`, admin ? 1 : 0, active ? 1 : 0);
   return id;
 }
 
-async function claim(userId, password = 'claimed-password') {
+async function claim(userId, password = 'claimed-password', forwardedFor) {
   return fetch(baseUrl, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(forwardedFor ? { 'x-forwarded-for': forwardedFor } : {})
+    },
     body: JSON.stringify({ userId, password }),
   });
 }
 
 describe('legacy credential first claim', () => {
+  beforeEach(() => _resetForTests());
+
   it('lets an active credential-less user claim once and receive a session', async () => {
     const userId = insertLegacyUser({ active: true });
     const first = await claim(userId);
@@ -56,5 +62,31 @@ describe('legacy credential first claim', () => {
   it('refuses an inactive credential-less user', async () => {
     const userId = insertLegacyUser({ active: false });
     expect((await claim(userId)).status).toBe(403);
+  });
+
+  it('refuses to claim a credential-less ADMIN account (no unauth admin takeover)', async () => {
+    const adminId = insertLegacyUser({ active: true, admin: true });
+    const res = await claim(adminId);
+    expect(res.status).toBe(403);
+    // The account must remain credential-less: the claim must not have written.
+    const row = getDb().prepare('SELECT password, pin FROM users WHERE id = ?').get(adminId);
+    expect(row.password).toBeNull();
+    expect(row.pin).toBeNull();
+  });
+
+  it('does not let failures from many client IPs lock a legacy user account', async () => {
+    const previous = process.env.TRUST_PROXY_HOPS;
+    process.env.TRUST_PROXY_HOPS = '1';
+    const userId = insertLegacyUser({ active: false });
+    try {
+      for (let i = 0; i < 20; i++) {
+        expect((await claim(userId, 'wrong', `203.0.113.${i + 1}`)).status).toBe(403);
+      }
+
+      expect((await claim(userId, 'wrong', '203.0.113.250')).status).toBe(403);
+    } finally {
+      if (previous === undefined) delete process.env.TRUST_PROXY_HOPS;
+      else process.env.TRUST_PROXY_HOPS = previous;
+    }
   });
 });

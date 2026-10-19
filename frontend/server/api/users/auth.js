@@ -1,9 +1,23 @@
-import { defineEventHandler, readBody, createError, setCookie, getRequestIP } from 'h3';
+import { defineEventHandler, readBody, createError, setCookie, deleteCookie } from 'h3';
 import { getDb } from '../../utils/db';
 import { verifyCredential, hashCredential } from '../../utils/credentials';
-import { createSession } from '../../utils/sessions';
-import { sessionCookieOpts, SESSION_COOKIE } from '../../middleware/session';
-import { checkRateLimit, recordFailure, recordSuccess } from '../../utils/rate-limit';
+import { createSession, createCredentialUpgrade, deleteSessionByToken } from '../../utils/sessions';
+import {
+  sessionCookieOpts,
+  upgradeCookieOpts,
+  SESSION_COOKIE,
+  UPGRADE_COOKIE
+} from '../../middleware/session';
+import {
+  AUTH_REQUEST_LIMIT,
+  AUTH_REQUEST_WINDOW_MS,
+  checkRateLimit,
+  configuredRequestLimit,
+  consumeRequestLimit,
+  recordFailure,
+  recordSuccess
+} from '../../utils/rate-limit';
+import { getClientIp } from '../../utils/requestIp';
 import { getBoolSetting } from '../../utils/systemSettings';
 
 // A hash to verify-against when the user/credential lookup misses, so the
@@ -38,18 +52,39 @@ export default defineEventHandler(async (event) => {
       return createError({ statusCode: 400, statusMessage: 'User ID is required' });
     }
 
-    // Rate limit per (userId, ip). The bucket is shared across password
-    // and PIN attempts — five wrong attempts in any combination locks the
-    // pair out for a while.
-    const ip = getRequestIP(event, { xForwardedFor: true }) || 'unknown';
-    const rlKey = `auth:${userId}:${ip}`;
-    const rl = checkRateLimit(rlKey);
-    if (!rl.allowed) {
+    // Two complementary IP-scoped limits:
+    //   - a fixed request budget bounds Argon2 work even when the caller rotates
+    //     random user IDs;
+    //   - per (userId, ip) failures add exponential backoff for credential
+    //     guessing without allowing other IPs to lock the victim account.
+    // The IP itself comes from getClientIp(), which does NOT trust
+    // client-supplied X-Forwarded-For unless the operator opts in via
+    // TRUST_PROXY_HOPS — closing the header-spoof bypass.
+    const ip = getClientIp(event);
+    const requestBudget = consumeRequestLimit(`auth-ip:${ip}`, {
+      limit: configuredRequestLimit('AUTH_REQUEST_LIMIT', AUTH_REQUEST_LIMIT),
+      windowMs: AUTH_REQUEST_WINDOW_MS
+    });
+    if (!requestBudget.allowed) {
       return createError({
         statusCode: 429,
-        statusMessage: `Too many failed attempts. Try again in ${rl.retryAfterSeconds}s.`
+        statusMessage: `Too many authentication requests. Try again in ${requestBudget.retryAfterSeconds}s.`
       });
     }
+    const ipKey = `auth:${userId}:${ip}`;
+    const rlIp = checkRateLimit(ipKey);
+    if (!rlIp.allowed) {
+      return createError({
+        statusCode: 429,
+        statusMessage: `Too many failed attempts. Try again in ${rlIp.retryAfterSeconds}s.`
+      });
+    }
+    const recordAuthFailure = () => {
+      recordFailure(ipKey);
+    };
+    const recordAuthSuccess = () => {
+      recordSuccess(ipKey);
+    };
 
     const db = getDb();
     const user = db
@@ -64,7 +99,7 @@ export default defineEventHandler(async (event) => {
       // Mirror the response shape AND timing of the "wrong password" path so
       // we don't leak user existence via response shape OR response time.
       await verifyCredential(password || pin || 'x', await getDummyHash());
-      recordFailure(rlKey);
+      recordAuthFailure();
       return { success: false, message: 'Invalid credentials' };
     }
 
@@ -79,7 +114,7 @@ export default defineEventHandler(async (event) => {
     }
 
     if (!password && !pin) {
-      recordFailure(rlKey);
+      recordAuthFailure();
       return { success: false, message: 'Invalid credentials' };
     }
 
@@ -113,53 +148,78 @@ export default defineEventHandler(async (event) => {
     }
 
     if (!matched) {
-      recordFailure(rlKey);
+      recordAuthFailure();
       return { success: false, message: 'Invalid credentials' };
     }
 
     // Best-effort inline migration: if the value matched but is still
-    // plaintext, rewrite it as an argon2 hash. Failure here must NOT
-    // block login — it just means the next login will retry.
+    // plaintext, rewrite it as an argon2 hash. Failure to *hash* must NOT
+    // block login — the next login will retry. But the write is a
+    // compare-and-swap against the exact legacy value we verified: if an
+    // admin reset the credential while we were hashing, the swap affects zero
+    // rows, meaning the credential we authenticated with is no longer current.
+    // In that case we refuse to issue a session rather than clobber the reset
+    // and hand out access after the admin's session revocation.
     if (needsRehash) {
+      const column = matched === 'password' ? 'password' : 'pin';
+      const verifiedValue = matched === 'password' ? user.password : user.pin;
       try {
         const fresh = await hashCredential(matched === 'password' ? password : pin);
-        const column = matched === 'password' ? 'password' : 'pin';
-        db.prepare(`UPDATE users SET ${column} = ? WHERE id = ?`).run(fresh, userId);
+        const res = db
+          .prepare(`UPDATE users SET ${column} = ? WHERE id = ? AND ${column} = ?`)
+          .run(fresh, userId, verifiedValue);
+        if (res.changes === 1) user[column] = fresh;
+        if (res.changes !== 1) {
+          console.warn(`[auth] credential changed mid-login for ${userId}; refusing session`);
+          recordAuthFailure();
+          return { success: false, message: 'Invalid credentials' };
+        }
       } catch (err) {
+        // Hashing/storage itself failed — nothing was overwritten, so the
+        // reset race does not apply; let the login proceed and retry later.
         console.warn(`[auth] inline rehash failed for ${userId}:`, err.message);
       }
     }
 
-    // Issue session.
-    const userAgent = event.node.req.headers['user-agent'] || null;
-    const { token, expiresAt } = createSession(db, userId, { userAgent });
-    setCookie(event, SESSION_COOKIE, token, sessionCookieOpts(event, expiresAt));
-    recordSuccess(rlKey);
-
-    // Surface "you should add a password" prompts to the client. We do NOT
-    // refuse the login — the user gets in but the UI walks them through
-    // the upgrade flow on the next screen.
-    //   - 'pin_disabled' → the user only has a PIN, but the admin globally
-    //     disabled PINs. They must add a password before continuing.
-    //   - The 'no_creds' case is handled by the bootstrap-credentials
-    //     endpoint instead, since /api/users/auth itself rejects callers
-    //     with neither stored credential earlier.
-    let needsCredentialUpdate = null;
-    if (matched === 'pin' && !user.password && !allowPin) {
-      needsCredentialUpdate = 'pin_disabled';
-    }
-
-    return {
-      success: true,
-      needsCredentialUpdate,
-      user: {
-        id: user.id,
-        name: user.name,
-        avatar: user.avatar,
-        isAdmin: user.isAdmin,
-        is_active: user.is_active
+    return db.transaction(() => {
+      const current = db.prepare('SELECT password, pin, is_active, isAdmin FROM users WHERE id = ?').get(userId);
+      if (!current || !current.is_active || current.password !== user.password ||
+          current.pin !== user.pin || current.isAdmin !== user.isAdmin ||
+          getBoolSetting(db, 'allow_pin', true) !== allowPin) {
+        recordAuthFailure();
+        return { success: false, message: 'Invalid credentials' };
       }
-    };
+      const needsPinUpgrade = matched === 'pin' && !user.password && !allowPin;
+      const userAgent = event.node.req.headers['user-agent'] || null;
+
+      if (needsPinUpgrade) {
+        // A pre-existing normal cookie would defeat the upgrade boundary, so
+        // revoke it before issuing the path-scoped bridge credential.
+        if (event.context.sessionToken) {
+          deleteSessionByToken(db, event.context.sessionToken);
+        }
+        deleteCookie(event, SESSION_COOKIE, { path: '/' });
+        const { token, expiresAt } = createCredentialUpgrade(db, userId);
+        setCookie(event, UPGRADE_COOKIE, token, upgradeCookieOpts(event, expiresAt));
+      } else {
+        const { token, expiresAt } = createSession(db, userId, { userAgent });
+        setCookie(event, SESSION_COOKIE, token, sessionCookieOpts(event, expiresAt));
+        deleteCookie(event, UPGRADE_COOKIE, { path: '/api/users/complete-pin-upgrade' });
+      }
+      recordAuthSuccess();
+
+      return {
+        success: true,
+        needsCredentialUpdate: needsPinUpgrade ? 'pin_disabled' : null,
+        user: {
+          id: user.id,
+          name: user.name,
+          avatar: user.avatar,
+          isAdmin: user.isAdmin,
+          is_active: user.is_active
+        }
+      };
+    }).immediate();
   } catch (error) {
     console.error('Error authenticating user:', error);
     return createError({ statusCode: 500, statusMessage: 'Authentication failed' });

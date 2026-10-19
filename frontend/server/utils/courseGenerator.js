@@ -1,6 +1,13 @@
+import { addVideoIds } from './videoIdentity.js';
 import fs from 'fs';
 import path from 'path';
-import { generateCourseId, naturalSort, VIDEO_EXTENSIONS } from './courseHelpers';
+import {
+  generateCourseId,
+  generateLegacyId,
+  shortStableHash,
+  naturalSort,
+  VIDEO_EXTENSIONS
+} from './courseHelpers';
 import { applyCourseJsonOverride } from './courseJsonOverride.js';
 
 function isVideoFile(name) {
@@ -23,7 +30,9 @@ async function findSubtitleSibling(videoFilePath) {
   const candidate = path.join(dir, srtName);
   try {
     await fs.promises.access(candidate);
-    return vttName;
+    const language = String(process.env.SUBTITLE_LANGUAGE || 'en').trim() || 'en';
+    const label = String(process.env.SUBTITLE_LABEL || language).trim() || language;
+    return { file: vttName, language, label };
   } catch {
     return null;
   }
@@ -34,7 +43,9 @@ export const generateLessonsFromFolder = async (coursePath) => {
   const lessons = [];
 
   const items = await fs.promises.readdir(coursePath, { withFileTypes: true });
-  const lessonDirs = items.filter((item) => item.isDirectory());
+  const lessonDirs = items
+    .filter((item) => item.isDirectory())
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
   const rootVideos = items.filter(
     (item) => !item.isDirectory() && isVideoFile(item.name),
   );
@@ -47,7 +58,11 @@ export const generateLessonsFromFolder = async (coursePath) => {
         title: stripVideoExt(video.name).replace(/_/g, ' '),
         file: video.name,
       };
-      if (subtitle) entry.subtitle = subtitle;
+      if (subtitle) {
+        entry.subtitle = subtitle.file;
+        entry.subtitleLanguage = subtitle.language;
+        entry.subtitleLabel = subtitle.label;
+      }
       return entry;
     }));
 
@@ -60,6 +75,8 @@ export const generateLessonsFromFolder = async (coursePath) => {
       videos: introVideos,
     });
   }
+
+  const usedLessonIds = new Set(lessons.map(lesson => lesson.id));
 
   for (const lessonDir of lessonDirs) {
     const lessonPath = path.join(coursePath, lessonDir.name);
@@ -74,17 +91,29 @@ export const generateLessonsFromFolder = async (coursePath) => {
             title: stripVideoExt(video.name).replace(/_/g, ' '),
             file: video.name,
           };
-          if (subtitle) entry.subtitle = subtitle;
+          if (subtitle) {
+            entry.subtitle = subtitle.file;
+            entry.subtitleLanguage = subtitle.language;
+            entry.subtitleLabel = subtitle.label;
+          }
           return entry;
         }),
     );
 
     if (lessonVideos.length > 0) {
-      const lessonId = lessonDir.name
-        .toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, '')
-        .replace(/\s+/g, '-')
-        .replace(/-+/g, '-');
+      // Keep old non-empty lesson IDs so existing progress remains attached.
+      // Only empty or colliding IDs move to a deterministic hashed form.
+      let lessonId = generateLegacyId(lessonDir.name);
+      if (!lessonId) lessonId = generateCourseId(lessonDir.name);
+      if (usedLessonIds.has(lessonId)) {
+        lessonId = `${lessonId || 'lesson'}-${shortStableHash(lessonDir.name)}`;
+      }
+      let suffix = 2;
+      const baseLessonId = lessonId;
+      while (usedLessonIds.has(lessonId)) {
+        lessonId = `${baseLessonId}-${suffix++}`;
+      }
+      usedLessonIds.add(lessonId);
 
       lessonVideos.sort((a, b) => naturalSort(a, b));
 
@@ -119,5 +148,5 @@ export const generateCourseJson = async (courseDir, coursePath) => {
   };
 
   const merged = applyCourseJsonOverride(coursePath, autoDetected);
-  return merged;
+  return addVideoIds(merged);
 };

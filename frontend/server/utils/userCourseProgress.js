@@ -1,3 +1,4 @@
+import { getVideoId } from '../../utils/videoIdentity.js';
 // Shared plumbing for the user-favorites and user-progress-courses
 // endpoints: load + parse a user's progress JSON blob and fetch full course
 // rows for a set of course IDs.
@@ -17,16 +18,61 @@ export function fetchCoursesByIds(db, courseIds) {
   if (!courseIds.length) return [];
   const placeholders = courseIds.map(() => '?').join(',');
   const rows = db.prepare(`
-    SELECT id, data FROM courses
-    WHERE id IN (${placeholders})
+    SELECT id, data, created_at FROM courses
+    WHERE available = 1 AND id IN (${placeholders})
   `).all(courseIds);
 
   return rows.map(row => {
     try {
-      return { id: row.id, data: JSON.parse(row.data) };
+      const data = JSON.parse(row.data);
+      return {
+        id: row.id,
+        data: { ...data, created_at: data.created_at || row.created_at }
+      };
     } catch (e) {
       console.error('Error parsing course data:', e);
       return null;
     }
   }).filter(Boolean);
+}
+
+export function getCourseVideoIds(course) {
+  const ids = [];
+  for (const lesson of course?.lessons || []) {
+    for (let index = 0; index < (lesson.videos || []).length; index += 1) {
+      ids.push(getVideoId(lesson, index));
+    }
+  }
+  return ids;
+}
+
+export function summarizeCourseProgress(course, stored = {}) {
+  const ids = getCourseVideoIds(course);
+  if (ids.length === 0) return { started: false, complete: false, percentage: 0 };
+
+  const completed = stored?.completed || {};
+  const progress = stored?.progress || {};
+  let totalPercent = 0;
+  let completedCount = 0;
+  let started = false;
+
+  for (const id of ids) {
+    if (completed[id] === true) {
+      completedCount += 1;
+      totalPercent += 100;
+      started = true;
+      continue;
+    }
+    const value = Number(progress[id]);
+    if (Number.isFinite(value) && value > 0) {
+      started = true;
+      totalPercent += Math.min(100, Math.max(0, value));
+    }
+  }
+
+  return {
+    started,
+    complete: completedCount === ids.length,
+    percentage: Math.round(totalPercent / ids.length)
+  };
 }
