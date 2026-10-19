@@ -40,10 +40,10 @@ test.describe('multiple content roots', () => {
     }
 
     await request.post(`/api/user-progress/${admin.id}`, {
-      data: { courseId: duplicates[0].id, data: { completed: { 'lesson-1-0': true }, progress: {}, favorite: false } }
+      data: { courseId: duplicates[0].id, revision: 0, data: { completed: { 'lesson-1-0': true }, progress: {}, favorite: false } }
     });
     await request.post(`/api/user-progress/${admin.id}`, {
-      data: { courseId: duplicates[1].id, data: { completed: {}, progress: { 'lesson-1-0': 25 }, favorite: true } }
+      data: { courseId: duplicates[1].id, revision: 0, data: { completed: {}, progress: { 'lesson-1-0': 25 }, favorite: true } }
     });
     const progress = await (await request.get(`/api/user-progress/${admin.id}`)).json();
     expect(progress.progress[duplicates[0].id].completed['lesson-1-0']).toBe(true);

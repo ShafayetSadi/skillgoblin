@@ -20,7 +20,7 @@ beforeEach(() => {
       category TEXT DEFAULT 'Uncategorized',
       release_date TEXT,
       data TEXT,
-      is_available INTEGER DEFAULT 1,
+      available INTEGER DEFAULT 1, video_count INTEGER NOT NULL DEFAULT 0, video_ids TEXT NOT NULL DEFAULT '[]',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );

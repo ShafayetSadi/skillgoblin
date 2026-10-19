@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { saveCourseToDb, markCourseUnavailable } from '../../server/utils/courseDatabase.js';
 
+import availability from '../../server/migrations/007_library_availability.js';
 let db;
 afterEach(() => db?.close());
 function makeDb() {
@@ -12,11 +13,12 @@ function makeDb() {
     CREATE TABLE courses (
       id TEXT PRIMARY KEY, content_root_id TEXT NOT NULL, relative_path TEXT NOT NULL,
       title TEXT NOT NULL, description TEXT, thumbnail TEXT, thumbnail_data BLOB,
-      category TEXT, release_date TEXT, data TEXT NOT NULL, is_available INTEGER DEFAULT 1,
+      category TEXT, release_date TEXT, data TEXT NOT NULL, available INTEGER DEFAULT 1, video_count INTEGER NOT NULL DEFAULT 0, video_ids TEXT NOT NULL DEFAULT '[]',
       created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
       last_seen_at TEXT, UNIQUE(content_root_id, relative_path)
     );
   `);
+  availability.up(db);
   return db;
 }
 const course = (id, title='Docker') => ({ id, title, description: '', thumbnail: 'thumbnail.png', category: 'Test', releaseDate: '', lessons: [] });
@@ -33,6 +35,6 @@ describe('root-scoped course persistence', () => {
     saveCourseToDb(course('one'), { rootId: 'a', relativePath: 'Docker' }, testDb);
     markCourseUnavailable('a', 'Docker', testDb);
     saveCourseToDb(course('one', 'Docker Updated'), { rootId: 'a', relativePath: 'Docker' }, testDb);
-    expect(testDb.prepare('SELECT title, is_available FROM courses WHERE id=?').get('one')).toEqual({ title: 'Docker Updated', is_available: 1 });
+    expect(testDb.prepare('SELECT title, available FROM courses WHERE id=?').get('one')).toEqual({ title: 'Docker Updated', available: 1 });
   });
 });

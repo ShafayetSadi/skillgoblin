@@ -86,7 +86,7 @@ export function synchronizeContentRoots(db, roots) {
     for (const root of roots) upsert.run(root.id, root.configuredPath, root.canonicalPath, root.position);
     const known = db.prepare('SELECT id FROM content_roots').all();
     const deactivate = db.prepare(`UPDATE content_roots SET is_configured=0, is_available=0, updated_at=CURRENT_TIMESTAMP WHERE id=?`);
-    const hideCourses = db.prepare(`UPDATE courses SET is_available=0, updated_at=CURRENT_TIMESTAMP WHERE content_root_id=?`);
+    const hideCourses = db.prepare(`UPDATE courses SET available=0, updated_at=CURRENT_TIMESTAMP WHERE content_root_id=?`);
     for (const row of known) {
       if (!configuredIds.has(row.id)) {
         deactivate.run(row.id);

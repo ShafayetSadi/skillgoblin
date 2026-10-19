@@ -31,21 +31,60 @@ export function hasCourseJson(courseFolderPath) {
   }
 }
 
+// course.json holds four short string fields; a sane file is well under a
+// kilobyte. Cap the read so a hostile/accidental multi-gigabyte course.json
+// can't be slurped into memory and wedge the scan.
+const MAX_COURSE_JSON_BYTES = 1 * 1024 * 1024; // 1 MiB
+
 // Read and parse course.json from a course folder. Strips a leading BOM and
 // validates that the top level is a plain object. Returns null on any
-// failure (missing file, bad JSON, wrong shape) after logging a warning so
-// an operator can debug without crashing the scan.
+// failure (missing file, bad JSON, wrong shape, oversized) after logging a
+// warning so an operator can debug without crashing the scan.
 export function readCourseJson(courseFolderPath) {
   const filePath = safeCourseJsonPath(courseFolderPath);
   if (!filePath) return null;
   let raw;
+  let fileDescriptor;
   try {
-    raw = fs.readFileSync(filePath, 'utf8');
+    fileDescriptor = fs.openSync(filePath, 'r');
+    const st = fs.fstatSync(fileDescriptor);
+    if (st.size > MAX_COURSE_JSON_BYTES) {
+      console.warn(`[courseJsonOverride] ${filePath} is ${st.size} bytes; exceeds ${MAX_COURSE_JSON_BYTES}-byte cap, ignoring.`);
+      return null;
+    }
+
+    // Keep the size check and read tied to the same opened file. Size the
+    // buffer from that descriptor, then probe for growth without ever reading
+    // more than the checked size plus one byte.
+    const buffer = Buffer.allocUnsafe(st.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const bytesRead = fs.readSync(
+        fileDescriptor,
+        buffer,
+        offset,
+        buffer.length - offset,
+        null,
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+
+    const growthProbe = Buffer.allocUnsafe(1);
+    if (fs.readSync(fileDescriptor, growthProbe, 0, 1, null) !== 0) {
+      console.warn(`[courseJsonOverride] ${filePath} grew while being read; ignoring.`);
+      return null;
+    }
+    raw = buffer.toString('utf8', 0, offset);
   } catch (err) {
     if (err.code !== 'ENOENT') {
       console.warn(`[courseJsonOverride] cannot read ${filePath}: ${err.message}`);
     }
     return null;
+  } finally {
+    if (fileDescriptor !== undefined) {
+      fs.closeSync(fileDescriptor);
+    }
   }
 
   let parsed;

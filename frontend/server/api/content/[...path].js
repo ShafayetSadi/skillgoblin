@@ -41,8 +41,8 @@ setInterval(() => {
 }, 30 * 1000).unref(); // Check every 30 seconds
 
 // Get content chunk from cache or read from file
-const getContentChunk = async (filePath, start, end) => {
-  const chunkKey = `${filePath}:${start}-${end}`;
+const getContentChunk = async (filePath, fileVersion, start, end) => {
+  const chunkKey = `${filePath}:${fileVersion}:${start}-${end}`;
   const chunkSize = end - start + 1;
   
   // Only use the cache for chunks that aren't too large
@@ -91,22 +91,6 @@ const getContentChunk = async (filePath, start, end) => {
   }
   
   return buffer;
-};
-
-// Prefetch next chunk (called after serving a chunk)
-const prefetchNextChunk = (filePath, currentEnd, fileSize) => {
-  const prefetchStart = currentEnd + 1;
-  const prefetchSize = Math.min(MAX_CHUNK_SIZE, fileSize - prefetchStart);
-  
-  // Skip prefetch for very small remaining parts
-  if (prefetchSize < 64 * 1024) return;
-  
-  // Asynchronously prefetch without waiting
-  getContentChunk(filePath, prefetchStart, prefetchStart + prefetchSize - 1)
-    .catch(err => {
-      // Just log errors, don't disrupt the main flow
-      console.error(`Prefetch error for ${filePath}: ${err.message}`);
-    });
 };
 
 // Check if compression should be used
@@ -264,6 +248,11 @@ export default defineEventHandler(async (event) => {
 
     // Determine content type based on file extension
     let contentType = 'application/octet-stream';
+    // Active/markup content must never render inline on our own origin: a
+    // malicious course bundle could otherwise run same-origin script against
+    // the authenticated (possibly admin) viewer and drive the admin APIs.
+    // We force a download (Content-Disposition: attachment) for those types.
+    let forceDownload = false;
     const ext = path.extname(filePath).toLowerCase();
 
     // We label all video extensions as video/mp4 because mainstream desktop
@@ -277,21 +266,38 @@ export default defineEventHandler(async (event) => {
       contentType = 'image/jpeg';
     } else if (ext === '.png') {
       contentType = 'image/png';
-    } else if (ext === '.js') {
-      contentType = 'application/javascript';
     } else if (ext === '.css') {
       contentType = 'text/css';
-    } else if (ext === '.html') {
-      contentType = 'text/html';
     } else if (ext === '.json') {
       contentType = 'application/json';
+    } else if (ext === '.vtt') {
+      // Subtitle track consumed by <track> — must stay inline text/vtt.
+      contentType = 'text/vtt; charset=utf-8';
     } else if (ext === '.svg') {
+      // Keep the image type so <img src="…​.svg"> subresources still render
+      // (nosniff requires a real image type), but force download on a
+      // top-level navigation so a script-bearing SVG can't execute here.
       contentType = 'image/svg+xml';
+      forceDownload = true;
+    } else if (ext === '.html' || ext === '.htm' || ext === '.xhtml' ||
+               ext === '.js' || ext === '.mjs' || ext === '.xml') {
+      contentType = 'application/octet-stream';
+      forceDownload = true;
+    } else {
+      // Unknown extension — download rather than let the browser guess.
+      forceDownload = true;
     }
-    
+
     // Set content type header
     setResponseHeader(event, 'Content-Type', contentType);
-    
+    if (forceDownload) {
+      setResponseHeader(
+        event,
+        'Content-Disposition',
+        `attachment; filename="${encodeURIComponent(path.basename(filePath))}"`
+      );
+    }
+
     // Common headers for all responses
     setResponseHeader(event, 'Connection', 'keep-alive');
     setResponseHeader(event, 'X-Content-Type-Options', 'nosniff');
@@ -301,6 +307,11 @@ export default defineEventHandler(async (event) => {
     
     // Handle video streaming with proper range support
     if (isVideo) {
+      // Cache identity must describe the current file, not just its path.
+      // Course managers commonly replace a video in place; without this
+      // version, an identical range request can return bytes cached from the
+      // previous file for up to five minutes.
+      const fileVersion = `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}`;
       setResponseHeader(event, 'Accept-Ranges', 'bytes');
       
       // Add caching headers for videos
@@ -326,10 +337,8 @@ export default defineEventHandler(async (event) => {
         
         try {
           // Get content chunk from cache or file
-          const buffer = await getContentChunk(filePath, start, end);
+          const buffer = await getContentChunk(filePath, fileVersion, start, end);
           
-          // Prefetch next chunk asynchronously (don't await)
-          prefetchNextChunk(filePath, end, stats.size);
           
           // Send the buffer directly
           return buffer;

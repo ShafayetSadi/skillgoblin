@@ -42,7 +42,7 @@ SkillGoblin is a lightweight, self-contained learning platform designed for loca
 
 ## Technical stack
 
-- **Frontend**: Nuxt 3 with Nitro server
+- **Frontend**: Nuxt 4 with Nitro server (Node 24)
 - **Database**: SQLite (file-based) with a forward-only migration framework
 - **Auth**: argon2id-hashed credentials, opaque cookie sessions
 - **Containerization**: Docker for development and production
@@ -91,14 +91,16 @@ Available to admins from the avatar dropdown in the top-right. Provides:
 
 ### Rate limiting
 
-`/api/users/auth` tracks failures per `(user_id, ip)` in process memory. After five wrong attempts, requests are 429-locked for 30 seconds, doubling on each subsequent block (60s, 120s, 240s, capped). Cooldown clears on a successful login. The bucket is per-process, so cluster-mode deployments would have separate buckets.
+`/api/users/auth` allows 20 total authentication requests per client IP per minute, then tracks failures per `(user_id, ip)`. After five wrong attempts for the same user from the same client, requests are 429-locked for 30 seconds, doubling on each subsequent block (60s, 120s, 240s, capped). There is deliberately no account-wide lockout that another client could use to deny a victim access. Anonymous registration is limited to 5 attempts per client IP per hour, and legacy credential claims to 10 per minute. These in-memory buckets reset on process restart; the limits can be raised with the configuration variables below for trusted bulk/test environments.
 
 ## Security model
 
 SkillGoblin is **homelab-grade**. Concretely:
 
 - **Not internet-facing.** Run it on a LAN, on a tailnet, or behind a VPN. Don't expose it directly.
-- **Trust assumptions.** `X-Forwarded-Proto` and `X-Forwarded-For` are trusted unconditionally. This is fine behind a real reverse proxy (Caddy, Nginx, Traefik) where those headers are set authoritatively, but means a directly-exposed instance with no proxy can be lied to by a client.
+- **Plain HTTP works by default.** Direct LAN HTTP uses normal `SameSite=Lax`, `HttpOnly` session cookies and does not emit HSTS. Security headers and same-origin checks still apply.
+- **Proxy configuration.** Rate limiting uses the transport peer by default. For an HTTPS reverse proxy, set `TRUST_PROXY_HOPS` to the exact number of trusted proxies that sanitize forwarded headers. This enables trusted `X-Forwarded-Proto=https`, Secure cookies, and HSTS. `COOKIE_SECURE=true` can force HTTPS cookie/header behavior when the proxy does not provide that header.
+- **Credential changes require re-authentication.** A signed-in user must enter their current password or PIN before adding or changing either credential. An administrator can still reset another user's credential.
 - **PIN brute-force surface.** A 4-digit PIN is 10,000 possibilities. Rate limiting helps but doesn't make PINs internet-grade. An admin who needs to expose a wider attack surface can disable PINs globally from the admin panel; existing PIN-only users are then prompted to set a password on next login.
 - **Credentials at rest.** Passwords and PINs are argon2id-hashed. Plaintext rows from older versions are detected on first login and rehashed inline.
 - **Sessions revoke server-side.** The cookie is opaque; revocation is a `DELETE` on the `user_sessions` row. "Log out all devices" and admin "kick sessions" both work this way.
@@ -120,8 +122,13 @@ The application reads the following environment variables:
 | `APP_THEME_COLOR` | No | `#111827` | Mobile browser chrome bar color and PWA manifest `theme_color`. Hex `#RRGGBB` or `#RGB`; invalid values fall back to default and log a startup warning. NOTE: This is the browser-chrome color, not the in-app dark/light theme. |
 | `APP_BACKGROUND_COLOR` | No | `#111827` | PWA splash screen background. Same hex format as `APP_THEME_COLOR`. |
 | `CONTENT_DIRS` | Yes | — | Comma-separated named absolute roots, for example `drive1=/courses/drive1,drive2=/courses/drive2`. Root names must match `[a-z][a-z0-9_-]*`. |
-| `DB_PATH` / `DATABASE_PATH` | No | `/app/data/database/database.sqlite` | Path to the SQLite database file. `DATABASE_PATH` takes precedence when both are set. |
+| `NUXT_DATABASE_PATH` / `DATABASE_PATH` / `DB_PATH` | No | `/app/data/database/database.sqlite` | Runtime SQLite path, in the listed precedence order. The server and operator CLI share this resolution. |
 | `CHOKIDAR_POLLING_INTERVAL` | No | `60000` | File watcher polling interval in milliseconds. Set to `0` to disable the watcher entirely (e.g. on Unraid, to stop drives spinning up). |
+| `TRUST_PROXY_HOPS` | No | `0` | Exact number of trusted reverse proxies. Leave at `0` for direct LAN HTTP. Set for a trusted HTTPS proxy so client-IP and forwarded-protocol headers are accepted. |
+| `COOKIE_SECURE` | No | auto | `true` forces Secure cookies/HSTS for HTTPS proxy setups; `false` forces them off for intentional plain LAN HTTP. Normally `TRUST_PROXY_HOPS` plus `X-Forwarded-Proto=https` is sufficient. |
+| `AUTH_REQUEST_LIMIT` | No | `20` | Authentication requests allowed per client IP per minute. Positive integer. |
+| `REGISTRATION_REQUEST_LIMIT` | No | `5` | Anonymous registration attempts allowed per client IP per hour. Positive integer. |
+| `CREDENTIAL_BOOTSTRAP_REQUEST_LIMIT` | No | `10` | Legacy credential-claim attempts allowed per client IP per minute. Positive integer. |
 | `HOST` | No | `0.0.0.0` | Bind address. |
 | `NEW_BADGE_DAYS` | No | `7` | How recent (in days) a course must be to render the `NEW` badge on its card. Set to `0` to disable the badge entirely. |
 | `PORT` | No | `3000` | Listen port. |
@@ -182,20 +189,28 @@ docker compose up
 
 ### Removing courses
 
-Delete the course folder from its content root. The watcher hides the course but
-retains its database row and progress. Recreating the same relative folder under
-the same named root restores its identity and progress.
+Delete the course folder from its content root. The watcher marks it unavailable and hides it from the library, preserving metadata and progress. Recreating the same relative folder under the same named root restores its identity and progress. An empty or disconnected media mount does not erase course history.
+
+## Recovery and diagnostics
+
+- [Backup, restore, and password recovery](docs/operations.md)
+- [Progress saves, conflict handling, and stable video IDs](docs/progress.md)
+- [Library and media diagnostics](docs/library-diagnostics.md) in Admin Panel → Diagnostics
+- [Node 24, AMD64/ARM64 images, tested publishing and digest promotion](docs/deployment.md)
 
 ## Upgrading from a previous version
 
+Back up the database before upgrading. New migrations preserve unavailable courses and translate old positional progress to stable video IDs before scanning. Reload open browser tabs after upgrading; the progress API now requires a revision with each write. See [progress migration details](docs/progress.md).
+
 Existing installations are migrated forward automatically. The migration framework records each applied migration in a `migrations` table; on boot, any new migrations run in numeric order inside a transaction. Migrations are forward-only — there is no rollback step.
 
-The `005_content_roots` migration maps each legacy `folder_name` to exactly one
+The `008_content_roots` migration maps each legacy `folder_name` to exactly one
 configured root, changes course IDs to stable root-scoped UUIDs, and rewrites
-progress keys in the same transaction. Before the first upgraded start, ensure
-every course currently in the database exists in exactly one configured root.
-Missing or ambiguous legacy folders abort and roll back the migration instead
-of guessing or losing progress. If you are introducing a second root containing
+progress keys and revisions in the same transaction. Before the first upgraded
+start, ensure every course currently in the database exists in exactly one
+configured root. With a single configured root, courses whose folders are
+already missing are kept as unavailable. Otherwise, missing or ambiguous legacy
+folders abort and roll back the migration instead of guessing or losing progress. If you are introducing a second root containing
 a duplicate legacy folder name, migrate with the original root first and add the
 second root after the first successful start.
 
@@ -208,7 +223,7 @@ The 002_auth_hardening migration (run on first boot of this version) does the fo
 What you'll see depending on the prior state of your install:
 
 - **Plaintext passwords / PINs.** Detected on each user's next successful login and rehashed inline (argon2id). Users do not need to do anything — they just log in normally.
-- **Users with no credentials.** Boot prints a warning listing them. On the trusted LAN, the first visitor who selects one of these legacy profiles can set its initial password or PIN and claim it. If the wrong person claims an account, an admin can reset its credentials from the Admin Panel. Do not use this recovery flow on an untrusted network; see [Security model](#security-model).
+- **Users with no credentials.** Boot prints a warning listing them. Legacy regular users can initialize credentials on the trusted LAN. Administrator accounts require the [operator recovery command](docs/operations.md#recover-a-forgotten-password-or-a-legacy-administrator-without-credentials); they cannot be claimed through the public API.
 - **No admin user exists.** The server refuses to boot until you set `ADMIN_NAME` / `ADMIN_PASSWORD` (see [First-run bootstrap](#first-run-bootstrap)).
 - **An admin already exists.** Bootstrap is skipped and the env vars are ignored. You log in with your existing admin credentials.
 
@@ -221,7 +236,7 @@ volumes. Content roots are read-only inputs and should be mounted with `:ro`.
 
 Operators who'd rather manage permissions themselves can opt out:
 - `user: "1000:1000"` in compose — entrypoint detects non-root start and skips the chown pass entirely.
-- `SKILLGOBLIN_SKIP_PERM_REPAIR=1` env — drops privileges to `node` but skips the chown pass. Useful when bind-mounting from tracked repo paths (the test compose sets this).
+- `SKILLGOBLIN_SKIP_PERM_REPAIR=1` env — drops privileges to `node` but skips the chown pass. Useful when the host already grants UID 1000 the required access.
 
 The Node process (the only thing on the network) never runs as root. The brief root window is bounded to the entrypoint's chown pass and `exec`-replaced into uid 1000 via `su-exec` before any TCP listener exists.
 
@@ -286,16 +301,23 @@ present on disk remains an import override and is reapplied on every rescan.
 Drop a sidecar `.srt` next to a video (same basename, e.g. `01-intro.mp4`
 and `01-intro.srt`). The server detects it at scan time, exposes a
 `subtitle` field on the video payload, and serves the matching `.vtt` URL
-via on-the-fly SRT-to-VTT conversion. The player UI to actually attach the
-WebVTT track and toggle CC ships in a follow-up PR (`feat/player-correctness`);
-this PR sets up the server side so the follow-up just wires the `<track>`.
+via on-the-fly SRT-to-VTT conversion. The player lists every text track the
+browser exposes, including subtitles embedded in the video container and the
+sidecar track. Selecting a language hides every other track; selecting the
+active language again turns subtitles off. The preference is restored for the
+next lesson when a matching track is available.
+
+Sidecars default to language code `en`. Set `SUBTITLE_LANGUAGE` to another
+BCP 47 language code and optionally set `SUBTITLE_LABEL` to the label you want
+shown in the player. The selector itself is language-agnostic and derives its
+buttons from the browser's `TextTrackList`.
 
 ### File monitoring
 
 - Real-time monitoring of every configured content root
 - Automatic detection of new courses and course updates
-- Automatic hiding and reactivation of removed courses
-- Retention and restoration of progress for temporarily removed courses
+- Missing courses are marked unavailable and hidden from the library
+- Metadata and user progress are retained for unavailable courses, and restored when the folder returns
 
 ### Benefits
 
@@ -355,7 +377,7 @@ docker compose -f docker-compose.test.yml down -v
 docker compose -f docker-compose.test.yml run --rm --build tests
 ```
 
-This runs the Vitest unit suite (~75 tests) followed by the Playwright e2e suite (~58 tests) against an isolated app container. The compose file sets a known `ADMIN_NAME` / `ADMIN_PASSWORD` for the test container; don't change those without also updating the test fixtures.
+This runs the Vitest unit suite followed by the Playwright e2e suite against an isolated app container. Media fixtures are copied into disposable named volumes; tracked fixtures and normal application data are not modified. The compose file sets a known `ADMIN_NAME` / `ADMIN_PASSWORD` for the test container; don't change those without also updating the test fixtures.
 
 ## Troubleshooting
 
@@ -373,11 +395,18 @@ The bootstrap plugin found no admin row and the env vars aren't set. Add `ADMIN_
 
 ### Locked out of admin
 
-If you have any other admin user, log in as them and reset the locked-out admin's credentials from the admin panel. If you have no other admin and lost the bootstrap admin's credentials, stop the container, open `data/database/database.sqlite` with any SQLite browser, manually clear the admin row, and restart with `ADMIN_NAME` / `ADMIN_PASSWORD` set so the bootstrap re-creates a fresh admin.
+Use another administrator's Admin Panel, or run the included operator command in Docker. List users, then replace `USER_ID` with the account ID:
+
+```sh
+docker compose -f docker-compose.prod.yml exec --user 1000:1000 skillgoblin node /app/scripts/operator.js users
+docker compose -f docker-compose.prod.yml exec --user 1000:1000 skillgoblin node /app/scripts/operator.js reset-password --user-id USER_ID
+```
+
+The hidden prompt asks twice for a new password. Reset preserves the account and progress, clears its PIN, and revokes its sessions. See [operations](docs/operations.md) for stdin, stopped-container, backup, and restore instructions.
 
 ### Database issues
 
-If you need to reset the database, stop the container and delete `data/database/database.sqlite`. The application will recreate it on next startup. Note that this erases all users, progress, and session data.
+Use a consistent live backup and validated offline restore from the [operations guide](docs/operations.md). Restore makes a safety backup before replacing the database and revokes restored sessions. Back up media and branding separately.
 
 ## License
 

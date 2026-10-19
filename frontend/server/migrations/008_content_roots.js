@@ -18,10 +18,13 @@ function migrateProgress(db, idMap) {
     for (const [courseId, value] of Object.entries(progress)) migrated[idMap.get(courseId) || courseId] = value;
     update.run(JSON.stringify(migrated), row.id);
   }
+  if (!tableExists(db, 'course_progress_revisions')) return;
+  const updateRevision = db.prepare('UPDATE course_progress_revisions SET course_id=? WHERE course_id=?');
+  for (const [oldId, newId] of idMap) if (oldId !== newId) updateRevision.run(newId, oldId);
 }
 
 export default {
-  name: '005_content_roots',
+  name: '008_content_roots',
   up(db) {
     const roots = parseContentRoots();
     db.exec(`
@@ -42,12 +45,25 @@ export default {
     for (const root of roots) insertRoot.run(root.id, root.configuredPath, root.canonicalPath, root.position);
 
     const columns = db.prepare("SELECT name FROM pragma_table_info('courses')").all().map(row => row.name);
-    if (columns.includes('content_root_id')) return;
+    if (columns.includes('content_root_id')) {
+      // Pre-release builds of this migration ran as 005_content_roots and
+      // named the course flag is_available; 007 has since added available.
+      if (columns.includes('is_available')) {
+        db.exec('UPDATE courses SET available = is_available');
+        db.exec('ALTER TABLE courses DROP COLUMN is_available');
+      }
+      return;
+    }
     const mapped = db.prepare('SELECT * FROM courses').all().map(row => {
       const matches = roots.filter(root => {
         try { return fs.lstatSync(path.join(root.canonicalPath, row.folder_name)).isDirectory(); }
         catch { return false; }
       });
+      // A course already marked unavailable (folder removed) cannot be located
+      // on disk; with a single root there is only one place it can belong.
+      if (matches.length === 0 && roots.length === 1) {
+        return { row: { ...row, available: 0 }, root: roots[0], newId: deriveCourseId(roots[0].id, row.folder_name) };
+      }
       if (matches.length !== 1) {
         const reason = matches.length === 0 ? 'was not found in any configured root' : `exists in roots: ${matches.map(r => r.id).join(', ')}`;
         throw new Error(`Cannot migrate legacy course "${row.folder_name}": ${reason}`);
@@ -56,12 +72,13 @@ export default {
     });
 
     db.exec(`
-      ALTER TABLE courses RENAME TO courses_legacy_005;
+      ALTER TABLE courses RENAME TO courses_legacy_008;
       CREATE TABLE courses (
         id TEXT PRIMARY KEY, content_root_id TEXT NOT NULL, relative_path TEXT NOT NULL,
         title TEXT NOT NULL, description TEXT, thumbnail TEXT, thumbnail_data BLOB,
         category TEXT DEFAULT 'Uncategorized', release_date TEXT, data TEXT NOT NULL,
-        is_available INTEGER NOT NULL DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        available INTEGER NOT NULL DEFAULT 1, video_count INTEGER NOT NULL DEFAULT 0,
+        video_ids TEXT NOT NULL DEFAULT '[]', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_seen_at TIMESTAMP,
         FOREIGN KEY (content_root_id) REFERENCES content_roots(id),
         UNIQUE(content_root_id, relative_path)
@@ -69,18 +86,22 @@ export default {
     `);
     const insertCourse = db.prepare(`
       INSERT INTO courses (id, content_root_id, relative_path, title, description, thumbnail,
-        thumbnail_data, category, release_date, data, is_available, created_at, updated_at, last_seen_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, CURRENT_TIMESTAMP)
+        thumbnail_data, category, release_date, data, available, video_count, video_ids,
+        created_at, updated_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     `);
     const idMap = new Map();
     for (const { row, root, newId } of mapped) {
       const data = JSON.parse(row.data);
       data.id = newId;
       insertCourse.run(newId, root.id, row.folder_name, row.title, row.description, row.thumbnail,
-        row.thumbnail_data, row.category, row.release_date, JSON.stringify(data), row.created_at, row.updated_at);
+        row.thumbnail_data, row.category, row.release_date, JSON.stringify(data), row.available ?? 1,
+        row.video_count ?? 0, row.video_ids ?? '[]', row.created_at, row.updated_at);
       idMap.set(row.id, newId);
     }
     migrateProgress(db, idMap);
-    db.exec('DROP TABLE courses_legacy_005');
+    // The legacy table took its indexes with it through the rename.
+    db.exec('DROP TABLE courses_legacy_008');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_courses_available_title ON courses(available, title)');
   }
 };

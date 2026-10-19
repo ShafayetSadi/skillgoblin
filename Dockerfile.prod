@@ -3,8 +3,8 @@ FROM node:24-alpine@sha256:2bdb65ed1dab192432bc31c95f94155ca5ad7fc1392fb7eb7526a
 WORKDIR /app
 
 # Native dependencies normally download prebuilt binaries, but retain the
-# standard node-gyp toolchain in the builder so transient prebuild outages do
-# not make production images impossible to build. These packages do not carry
+# standard node-gyp toolchain in the builder so modules can be compiled on
+# each target when a prebuild is unavailable. These packages do not carry
 # into the final runtime stage.
 RUN apk add --no-cache python3 make g++
 
@@ -24,7 +24,7 @@ COPY frontend ./
 # Build the application
 RUN npm run build
 
-FROM node:24-alpine@sha256:2bdb65ed1dab192432bc31c95f94155ca5ad7fc1392fb7eb7526ab682fa5bf14
+FROM node:24-alpine@sha256:2bdb65ed1dab192432bc31c95f94155ca5ad7fc1392fb7eb7526ab682fa5bf14 AS production
 
 WORKDIR /app
 
@@ -42,6 +42,13 @@ RUN apk add --no-cache ffmpeg su-exec
 # `node` user (uid 1000) shipped by the official node:24-alpine image so the
 # runtime stage can drop privileges via USER below.
 COPY --from=builder --chown=node:node /app/.output ./.output
+
+# Operator CLI shares the server native runtime dependencies.
+COPY --from=builder --chown=node:node /app/scripts ./scripts
+COPY --from=builder --chown=node:node /app/server/utils ./server/utils
+COPY --from=builder --chown=node:node /app/server/migrations ./server/migrations
+COPY --from=builder /app/package.json ./package.json
+RUN ln -s /app/.output/server/node_modules /app/node_modules
 
 # Copy public directory and static assets
 COPY --chown=node:node frontend/public ./public
@@ -95,3 +102,14 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # instead of running as root.
 ENTRYPOINT ["/usr/local/bin/skillgoblin-entrypoint.sh"]
 CMD ["node", ".output/server/index.mjs"]
+
+# Supported Node and locked Playwright, with no writable source bind mounts.
+FROM node:24-bookworm-slim AS test-runner
+WORKDIR /work
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
+COPY frontend/package*.json frontend/.npmrc ./
+RUN npm ci && npx playwright install --with-deps chromium
+COPY frontend ./
+CMD ["sh", "-c", "npm run test:unit && npm run test:e2e"]
+
+FROM production AS final

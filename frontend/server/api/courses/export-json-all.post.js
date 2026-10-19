@@ -8,7 +8,7 @@ export default defineEventHandler((event) => {
   const rows = getDb().prepare(`
     SELECT c.id, c.title, c.description, c.category, c.release_date
     FROM courses c JOIN content_roots r ON r.id=c.content_root_id
-    WHERE c.is_available=1 AND r.is_configured=1 AND r.is_available=1
+    WHERE c.available=1 AND r.is_configured=1 AND r.is_available=1
     ORDER BY c.title, c.id
   `).all();
   const payload = { version: 1, courses: rows.map(row => ({ id: row.id, metadata: buildCourseJsonPayload(row) })) };
